@@ -9,6 +9,9 @@ from llm_client import get_llm
 from rag.retriever import HybridRetriever
 from graph.workflow import build_workflow, create_initial_state
 
+# 单条消息发送超时（秒）：客户端半开连接时 send 可能长期挂起，超时后转为缓冲等待重连
+SEND_TIMEOUT = 5.0
+
 
 class MessageBuffer:
     """断线重传缓冲：配置了 REDIS_URL 用 Redis，否则使用进程内缓冲。"""
@@ -57,21 +60,6 @@ class MessageBuffer:
             return await asyncio.to_thread(self._redis.lrange, key, 0, -1)
         return list(self._memory[key])
 
-    async def remove_first(self, key: str, count: int):
-        """删除已成功补发的前 count 条，保留补发期间新追加的消息。"""
-        if count <= 0:
-            return
-        if self._use_redis:
-            await asyncio.to_thread(self._redis.ltrim, key, count, -1)
-            return
-        del self._memory[key][:count]
-
-    async def delete(self, key: str):
-        if self._use_redis:
-            await asyncio.to_thread(self._redis.delete, key)
-        else:
-            self._memory.pop(key, None)
-
 
 class ClassroomSession:
     """一次课堂会话：持有状态机、WebSocket 连接与推送序号。"""
@@ -93,6 +81,10 @@ class ClassroomSession:
         self.message_count = 0
         self.buffer_key = f"ws:buffer:{session_id}"
         self.running = False
+        # 课堂流程是否已启动过（防止重复 start 把状态机再跑一遍）
+        self.started = False
+        # 推送串行化锁：保证「重连补发」与「实时推送」不交错，避免消息乱序/漏补
+        self._send_lock = asyncio.Lock()
 
     async def push(self, payload: dict):
         """推送一条消息：连接可用则直接发送，否则入断线缓冲。"""
@@ -109,6 +101,10 @@ class ClassroomSession:
 
     async def run(self):
         """流式执行 LangGraph 状态机，并把节点产出的消息逐条推送给前端。"""
+        if self.started:
+            # 已启动过：忽略重复 start，避免状态机在 round=7 后再次执行
+            return
+        self.started = True
         self.running = True
         # 追踪最近一次已知的轮次/阶段：student/arbiter 的 update 不携带这两个字段，
         # 推送学生消息时沿用老师节点写入的值，避免前端阶段显示回退或变成 None
@@ -161,7 +157,7 @@ class ClassroomSession:
                 await self.push(
                     {
                         "type": "error",
-                        "content": f"课堂运行异常：{e}",
+                        "content": f"课堂运行异常：{e!r}",
                         "phase": cur_phase,
                         "round": cur_round,
                     }
@@ -177,18 +173,26 @@ async def send_or_buffer(session: ClassroomSession, payload: dict, msg_id: int):
 
     为什么发送成功也要缓冲：连接刚断开时 ASGI 层的 send 可能不会立刻报错，
     消息看似"已发送"但客户端实际收不到；统一先缓冲、重连时用 last_msg_id 去重补发，
-    才能做到真不丢消息。补发成功的部分会在 replay_missed 中统一裁剪。
+    才能做到真不丢消息。缓冲在整堂课期间保留，重连时按 last_msg_id 过滤（便于多客户端/刷新后补齐历史）。
+
+    与 replay_missed 共用 session._send_lock：重连补发期间新产生的消息必须等补发结束
+    再发送，否则新消息会被插到旧消息前面，既乱序又会让后续按 last_msg_id 去重时漏掉旧消息。
     """
     stored = {**payload, "id": msg_id}
-    await session.buffer.rpush(session.buffer_key, json.dumps(stored))
+    async with session._send_lock:
+        await session.buffer.rpush(session.buffer_key, json.dumps(stored))
 
-    ws = session.ws
-    if ws is not None:
+        ws = session.ws
+        if ws is None:
+            return
         try:
-            await ws.send_json(stored)
-        except (BrokenPipeError, RuntimeError):
-            # 发送失败无需额外处理：消息已在缓冲里，等重连补发
-            pass
+            # 半开连接时 send 可能长时间挂起，超时后按发送失败处理（消息已入缓冲）
+            await asyncio.wait_for(ws.send_json(stored), timeout=SEND_TIMEOUT)
+        except Exception:
+            # 不限定异常类型：Starlette 在连接断开时可能抛 RuntimeError / WebSocketDisconnect / OSError，
+            # 发送失败都不应中断课堂——消息已在缓冲里，等重连补发
+            if session.ws is ws:
+                session.ws = None
 
 
 # ============ 全局单例 ============

@@ -22,7 +22,7 @@ Vue3 + Vite ──REST / WebSocket──► FastAPI 后端 ──► LangGraph S
 - **编排**：LangGraph `StateGraph` 共 5 类节点 `teacher / student / arbiter / ta / manager`；条件路由以单调递增的 `round` 计数为唯一依据，`phase` 仅用于前端展示，避免课堂顺序来回跳变。
 - **RAG**：`backend/rag/ingest.py` 解析教材（txt / md / pdf / docx）并建 FAISS 索引；检索时 FAISS 向量召回 + BM25 关键词召回（jieba 分词）混合去重，重排模型未缓存时自动跳过。
 - **对话记忆**：短期滑窗 + LLM 摘要压缩 + 实体（章节号 / 定理名等）关联，注入老师 Prompt；当前为进程内实现。
-- **WebSocket 断线续传**：前端 30s 心跳（`ping` / `pong`）；发送中的消息统一先入缓冲，断线重连时携带 `last_msg_id`，后端只补发未收到的消息（去重不重复），缓冲在 Redis 未配置时使用进程内实现。
+- **WebSocket 断线续传**：前端 30s 心跳（`ping` / `pong`）；每条消息先入缓冲、再尝试推送，断线重连时携带 `last_msg_id`，后端只补发未收到的消息（去重不重复）；缓冲在 Redis 未配置时使用进程内实现，且**整堂课保留、不裁剪**（单堂课约 26 帧/十几 KB）。补发与实时推送共用一把会话级 `asyncio.Lock` 串行化，保证客户端严格按消息 id 递增接收；「开始授课」指令幂等，重复发送不会让课堂再跑一遍；自动重连有次数上限，会话不存在（服务端 close 4004）时停止重连并提示重新发起授课。
 - **Mock LLM**：未配置 `LLM_API_KEY` 时自动降级为内置 Mock LLM，无 Key 也能跑通完整课堂流程，便于本地演示与测试。
 
 ## 目录结构
@@ -55,13 +55,13 @@ ai-classroom/
 
 ## 环境要求
 
-| 组件 | 要求 | 说明 |
-|------|------|------|
-| Python | 3.10+ | 本项目自带虚拟环境 `.venv`（Python 3.13）；Windows 激活命令 `.venv\Scripts\activate` |
-| Node.js | 18+ | 前端构建（Docker 镜像使用 `node:20-alpine`） |
-| Redis | 可选 | 配置 `REDIS_URL` 时 WebSocket 断线消息缓冲走 Redis；**未配置时使用进程内缓冲**（单进程部署可用） |
-| 网络 / 模型 | 首次需下载嵌入模型 | `bge-large-zh` 约 1.2GB（CPU 可跑，无需 GPU）；可选重排模型 `bge-reranker-large` 未缓存时自动跳过 |
-| 索引路径 | 纯英文路径 | faiss 的 C 层读写不支持中文目录，而本项目路径含「ai实验」，故 `VECTOR_INDEX_PATH` 必须指向纯英文目录（如 `E:\ai_classroom_index`） |
+| 组件      | 要求        | 说明                                                                                            |
+| ------- | --------- | --------------------------------------------------------------------------------------------- |
+| Python  | 3.10+     | 本项目自带虚拟环境 `.venv`（Python 3.13）；Windows 激活命令 `.venv\Scripts\activate`                          |
+| Node.js | 18+       | 前端构建（Docker 镜像使用 `node:20-alpine`）                                                            |
+| Redis   | 可选        | 配置 `REDIS_URL` 时 WebSocket 断线消息缓冲走 Redis；**未配置时使用进程内缓冲**（单进程部署可用）                             |
+| 网络 / 模型 | 首次需下载嵌入模型 | `bge-large-zh` 约 1.2GB（CPU 可跑，无需 GPU）；可选重排模型 `bge-reranker-large` 未缓存时自动跳过                    |
+| 索引路径    | 纯英文路径     | faiss 的 C 层读写不支持中文目录，而本项目路径含「ai实验」，故 `VECTOR_INDEX_PATH` 必须指向纯英文目录（如 `E:\ai_classroom_index`） |
 
 ## 快速开始（本地开发）
 
@@ -133,18 +133,18 @@ npm run dev
 
 ### Makefile 常用命令（项目根目录执行）
 
-| 命令 | 作用 |
-|------|------|
-| `make install` | 安装后端依赖（`pip install -r backend/requirements.txt`）与前端依赖（`cd frontend && npm install`） |
-| `make ingest` | 构建知识库索引（`cd backend && python rag/ingest.py --path ../knowledge_base`） |
-| `make dev-backend` | 启动后端（`cd backend && uvicorn main:app --reload --port 8000`） |
-| `make dev-frontend` | 启动前端（`cd frontend && npm run dev`） |
-| `make up` / `make down` | Docker Compose 启动 / 停止 |
-| `make clean` | 清理 Python / Node 缓存（`find`、`rm` 命令，建议在 Git Bash 中执行） |
+| 命令                      | 作用                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| `make install`          | 安装后端依赖（`pip install -r backend/requirements.txt`）与前端依赖（`cd frontend && npm install`） |
+| `make ingest`           | 构建知识库索引（`cd backend && python rag/ingest.py --path ../knowledge_base`）               |
+| `make dev-backend`      | 启动后端（`cd backend && uvicorn main:app --reload --port 8000`）                          |
+| `make dev-frontend`     | 启动前端（`cd frontend && npm run dev`）                                                   |
+| `make up` / `make down` | Docker Compose 启动 / 停止                                                               |
+| `make clean`            | 清理 Python / Node 缓存（`find`、`rm` 命令，建议在 Git Bash 中执行）                                 |
 
 ## 测试
 
-P0 回归冒烟测试使用内置 Mock LLM，**不需要真实 API Key、不需要向量索引**，几秒内可跑完，覆盖：断线缓冲 LRANGE 语义、Mock LLM 下的完整课堂流程（老师 / 学生 / 助教 / 管理员消息与 phase/round 字段）、断线重连续传不丢尾消息。
+P0 回归冒烟测试使用内置 Mock LLM，**不需要真实 API Key、不需要向量索引**，几秒内可跑完，覆盖 7 组用例：断线缓冲 LRANGE 语义、Mock LLM 下的完整课堂流程（老师 / 学生 / 助教 / 管理员消息与 phase/round 字段、重复 start 幂等）、断线续传不丢尾消息、补发只发给当前连接（多连接不串台）、补发与实时推送串行化（不乱序）、发送异常不中止课堂、全部学生超时（order_alerts）时路由不卡死。
 
 ```bash
 cd backend
@@ -157,11 +157,11 @@ python tests/test_smoke.py
 
 ### REST
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/api/health` | 健康检查，返回 `{"status": "ok"}` |
-| `POST` | `/api/classroom/start` | 创建课堂会话；请求体 `{"topic": "授课主题"}`，返回 `{"session_id": "...", "topic": "..."}` |
-| `GET` | `/api/classroom/{session_id}` | 查询会话状态（`running` / `round` / `phase` / `msg_count` / `message_count` 等） |
+| 方法     | 路径                            | 说明                                                                        |
+| ------ | ----------------------------- | ------------------------------------------------------------------------- |
+| `GET`  | `/api/health`                 | 健康检查，返回 `{"status": "ok"}`                                                |
+| `POST` | `/api/classroom/start`        | 创建课堂会话；请求体 `{"topic": "授课主题"}`，返回 `{"session_id": "...", "topic": "..."}` |
+| `GET`  | `/api/classroom/{session_id}` | 查询会话状态（`running` / `round` / `phase` / `msg_count` / `message_count` 等）   |
 
 另有 `GET /` 返回服务入口说明，`GET /docs` 为 OpenAPI 文档。
 
@@ -201,7 +201,6 @@ python rag/ingest.py --path ../knowledge_base --output ../knowledge_base/faiss_i
 
 - compose 把 `./knowledge_base` 挂载到容器 `/app/knowledge_base`，而容器内 `VECTOR_INDEX_PATH=knowledge_base/faiss_index`（相对后端工作目录 `/app`），实际读取 `/app/knowledge_base/faiss_index`——容器内是纯英文路径，规避了 faiss C 层不支持中文目录的问题。
 - 若宿主机项目路径含中文导致 faiss 写入失败，可先构建到纯英文目录，再把索引产物复制到挂载目录（复制由操作系统完成，不受 faiss 中文路径限制）：
-
   ```bat
   cd backend
   python rag/ingest.py --path ../knowledge_base --output E:\ai_classroom_index
@@ -218,11 +217,11 @@ python rag/ingest.py --path ../knowledge_base --output ../knowledge_base/faiss_i
 docker compose up -d          # 旧版 Docker：docker-compose up -d
 ```
 
-| 服务 | 地址 | 说明 |
-|------|------|------|
-| frontend | <http://localhost> | Nginx 托管前端静态资源，并反向代理 `/api`、`/ws` 到 backend |
-| backend | <http://localhost:8000/api/health> | FastAPI 后端 |
-| redis | `localhost:6379` | 供 WebSocket 断线消息缓冲使用 |
+| 服务       | 地址                                 | 说明                                          |
+| -------- | ---------------------------------- | ------------------------------------------- |
+| frontend | <http://localhost>                 | Nginx 托管前端静态资源，并反向代理 `/api`、`/ws` 到 backend |
+| backend  | <http://localhost:8000/api/health> | FastAPI 后端                                  |
+| redis    | `localhost:6379`                   | 供 WebSocket 断线消息缓冲使用                        |
 
 停止并移除容器：`docker compose down`（旧版：`docker-compose down`）。
 
@@ -241,6 +240,7 @@ docker compose up -d          # 旧版 Docker：docker-compose up -d
 - 前端「答题 / 作业」面板为骨架占位，尚未接入答题交互。
 - 三层记忆为进程内实现，进程 / 容器重启后丢失（生产可序列化到 Redis）。
 - 未配置 Redis 时，断线消息缓冲仅在单进程内有效；多 worker 部署需配置 Redis。
+- 同一 `session_id` 仅保留最近一个活动 WebSocket 连接（Demo 按单客户端使用）；会话与整堂课的消息缓冲不做过期清理（单堂课约 26 帧/十几 KB），长期运行多课堂需自行加 TTL。
 - 会话 id 未持久化到 URL / 浏览器存储，刷新页面会丢失当前课堂视图，需要重新发起授课。
 - 暂无鉴权、多班级、权限体系，定位为 Demo 演示，不建议直接用于真实教学场景。
 

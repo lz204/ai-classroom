@@ -3,8 +3,12 @@
  * 与后端 /ws/{session_id} 端点配合，保证课堂消息不丢失、不重复。
  */
 
-// 重连退避序列（秒）
+// 重连退避序列（秒），最多重试 MAX_RECONNECT_ATTEMPTS 次
 const RECONNECT_DELAYS = [1, 2, 4, 8]
+// 自动重连次数上限：超过后停止重试并提示用户（会话不存在/服务长时间不可用）
+const MAX_RECONNECT_ATTEMPTS = 5
+// 服务端「会话不存在」关闭码（main.py 中 accept 后 close(4004)）
+const CLOSE_SESSION_NOT_FOUND = 4004
 
 export default class ClassroomSocket {
   /**
@@ -19,6 +23,7 @@ export default class ClassroomSocket {
     this.reconnectIndex = 0
     this.heartbeatTimer = null
     this.manualClosed = false
+    this.ended = false // 课堂已结束：不再自动重连
   }
 
   /** 建立连接（携带 last_msg_id 以便补发断线期间的消息） */
@@ -45,6 +50,7 @@ export default class ClassroomSocket {
       } else if (data.type === 'alert') {
         this.handlers.onAlert?.(data)
       } else if (data.type === 'end') {
+        this.ended = true
         this.handlers.onEnd?.(data)
       } else if (data.type === 'error') {
         this.handlers.onError?.(data)
@@ -53,10 +59,20 @@ export default class ClassroomSocket {
       }
     }
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (event) => {
       this._stopHeartbeat()
       this.handlers.onStatus?.('disconnected')
-      if (this.manualClosed) return
+      if (this.manualClosed || this.ended) return
+      // 会话不存在（4004）：重连也不会有结果，提示用户重新发起授课
+      if (event.code === CLOSE_SESSION_NOT_FOUND) {
+        this.handlers.onError?.({ content: '课堂会话不存在或已失效，请重新发起授课' })
+        return
+      }
+      // 重连次数达到上限后停止，避免对不可用服务无限重试
+      if (this.reconnectIndex >= MAX_RECONNECT_ATTEMPTS) {
+        this.handlers.onError?.({ content: '连接已中断且自动重连失败，请刷新页面重试' })
+        return
+      }
       // 指数退避重连（上限 8s）
       const delay = RECONNECT_DELAYS[Math.min(this.reconnectIndex, RECONNECT_DELAYS.length - 1)]
       this.reconnectIndex += 1

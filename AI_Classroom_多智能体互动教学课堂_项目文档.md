@@ -427,6 +427,8 @@ def route_by_phase(state: ClassroomState) -> str:
 
 > **order_alerts 清空机制**：`order_alerts` 非空时路由会优先跳转 `manager`（秩序干预），`manager_node` 处理完告警后**必须清空 `order_alerts` 字段**再交回 teacher，否则路由会因告警始终非空而反复跳转 manager，形成 `manager → teacher → manager` 死循环。清空动作由 manager 节点在 return 中显式置空完成。
 
+> **已知行为（告警会消耗一轮）**：`manager` 处理完告警后回到 `teacher`，`round` 继续 +1，因此告警触发的课堂会少执行一轮学生提问（实测学生轮次 4 → 2、`discuss` 轮可能缺席）。当前 Demo 接受该简化；若要让告警"插播"后回到原路由目标，需要把路由依据从 `round` 改为阶段栈（Phase Stack），或在 manager 节点记录被拦截的目标节点。
+
 **为什么用条件边（conditional_edges）而非硬编码 if-else？**
 阶段流转规则集中在路由函数中，新增阶段时只需扩展枚举与路由映射，无需改状态机构建代码；同时 LangGraph 支持把状态图导出为 Mermaid，便于调试阶段跳转。
 
@@ -852,35 +854,44 @@ from openai import RateLimitError, APIConnectionError
     retry=tenacity.retry_if_exception_type((RateLimitError, APIConnectionError)),
 )
 async def llm_invoke(prompt: str) -> str:
-    return await asyncio.wait_for(llm.ainvoke(prompt), timeout=10.0)
+    # LLM_TIMEOUT 由 config 读取（默认 60s，课堂 prompt 含 RAG 参考内容，生成耗时较长）
+    return await asyncio.wait_for(llm.ainvoke(prompt), timeout=LLM_TIMEOUT)
 ```
 
-**2. WebSocket 断线续传（先缓冲后发送 + last_msg_id 去重补发）**：实测发现连接刚断开时 ASGI 层的 `send` 可能不会立刻抛错，消息"看似发送成功"但客户端收不到。因此实现改为**每条消息先写入消息缓冲（配置 `REDIS_URL` 用 Redis，否则进程内列表），再尝试推送**；前端重连时携带 `last_msg_id`，后端只补发 id 更大的消息，补发成功后裁剪已补发的快照；补发中途再次断线则保留缓冲等下次重连继续——既不丢消息，也不重复推送。
+**2. WebSocket 断线续传（先缓冲后发送 + last_msg_id 去重补发）**：实测发现连接刚断开时 ASGI 层的 `send` 可能不会立刻抛错，消息"看似发送成功"但客户端收不到。因此实现改为**每条消息先写入消息缓冲（配置 `REDIS_URL` 用 Redis，否则进程内列表），再尝试推送**；前端重连时携带 `last_msg_id`，后端从缓冲中只补发 id 更大的消息。发送/补发统一捕获所有发送异常（断线时 Starlette 可能抛 `RuntimeError` / `WebSocketDisconnect` / `OSError`），失败只意味着消息留在缓冲里，不会中断课堂；单条发送加 5s 超时，避免半开连接把课堂卡死。
 
 ```python
 async def send_or_buffer(session, payload: dict, msg_id: int):
     stored = {**payload, "id": msg_id}
-    # 无论发送成败都先入缓冲：避免"send 未报错但客户端已断线"导致丢消息
-    await session.buffer.rpush(session.buffer_key, json.dumps(stored))
-    if session.ws is not None:
+    async with session._send_lock:                      # 与 replay 串行化，保证消息顺序
+        await session.buffer.rpush(session.buffer_key, json.dumps(stored))  # 先入缓冲
+        ws = session.ws
+        if ws is None:
+            return
         try:
-            await session.ws.send_json(stored)
-        except (BrokenPipeError, RuntimeError):
-            pass  # 消息已在缓冲中，等重连补发
+            await asyncio.wait_for(ws.send_json(stored), timeout=SEND_TIMEOUT)
+        except Exception:
+            # 断线异常类型不可枚举（RuntimeError/WebSocketDisconnect/OSError），一律按发送失败处理
+            if session.ws is ws:
+                session.ws = None
 
 
-async def replay_missed(session, last_msg_id: int):
-    buffered = await session.buffer.peek_all(session.buffer_key)
-    try:
-        for item in buffered:
-            payload = json.loads(item)
-            if payload.get("id", 0) > last_msg_id:
-                await session.ws.send_json(payload)
-    except Exception:
-        return  # 补发途中断线：保留缓冲，下次重连继续
-    # 裁剪已成功补发的快照；补发期间新追加的消息仍保留在缓冲中
-    await session.buffer.remove_first(session.buffer_key, len(buffered))
+async def replay_missed(session, ws: WebSocket, last_msg_id: int):
+    # 显式传入当前连接：避免双连接并发补发时把消息错发到另一个连接
+    async with session._send_lock:
+        buffered = await session.buffer.peek_all(session.buffer_key)  # 缓冲整堂课保留、不裁剪
+        try:
+            for item in buffered:
+                payload = json.loads(item)
+                if payload.get("id", 0) > last_msg_id:
+                    await asyncio.wait_for(ws.send_json(payload), timeout=SEND_TIMEOUT)
+        except Exception:
+            return  # 补发途中再次断线：消息仍在缓冲，下次重连按新的 last_msg_id 继续
 ```
+
+> **并发串行化**：`send_or_buffer` 与 `replay_missed` 共用 `session._send_lock`。若不加锁，重连补发期间新产生的消息会直接 `send` 插到旧消息前面（实测顺序为 `1,4,2,3`），既造成前端气泡乱序，又会让客户端按 `last_msg_id` 去重时永久漏掉旧消息；加锁后顺序恒为 `1,2,3,4`。另外 WS 端点的 `start` 指令用 `session.started` 做幂等保护，重复发送不会让课堂状态机再跑一遍；会话不存在时先 `accept` 再 `close(4004)`，前端据此停止自动重连。
+
+> **缓冲为什么不裁剪**：发送成功的消息也留在缓冲里，重连只按 `last_msg_id` 过滤。这样无论客户端刷新、多客户端补历史还是补发途中断线，都不会因为"快照被删除"而永久丢消息；代价是单堂课约 26 帧、十几 KB 常驻内存，会话与缓冲的 TTL 清理列入演进项（见 10.1）。
 
 **3. RAG 检索降级**：FAISS 索引文件偶尔会因异常中断导致损坏，加载失败时给出明确报错并提示重新构建索引，避免服务直接崩溃。
 
@@ -908,7 +919,7 @@ def load_vectorstore():
 - **我的解法**：
   1. 把 State 的 `messages` 字段改为 `Annotated[list, operator.add]`，让 LangGraph 自动做追加合并而不是覆盖；
   2. 但追加合并后顺序是 LLM 完成顺序（不确定），于是学生群节点改为**只产出本次新增消息（`new_messages`）**，由 `arbiter` 仲裁节点用 `asyncio.Lock` 串行化写入，按 `SpeakerQueue` 优先级 + 时间戳排序后再追加进 `messages`；
-  3. 单个 Agent 超时（`asyncio.wait_for` 10s）不阻塞队列，记入 `order_alerts` 作为走神提醒。
+  3. 单个 Agent 超时（`asyncio.wait_for` 30s）不阻塞队列，记入 `order_alerts` 作为走神提醒。
 - **结果**：消息不再丢失，顺序严格按发言队列排序。
 
 ### 7.2 踩坑二：RAG 检索返回前言/目录，正文丢失

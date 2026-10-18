@@ -108,6 +108,8 @@ const connState = ref('idle') // idle | connecting | connected | disconnected
 const currentPhase = ref('') // 最近一次消息上报的阶段（学生消息缺少该字段时不会回退）
 const currentRound = ref(0)
 const chatListRef = ref(null)
+// 本会话是否已发送过「开始授课」指令（重连时不再重复发送）
+let startSent = false
 
 const connText = computed(() => {
   return { idle: '未连接', connecting: '连接中', connected: '已连接', disconnected: '已断开' }[connState.value]
@@ -133,7 +135,13 @@ async function handleStart() {
     // 1. REST 创建课堂会话
     const { session_id } = await startClassroom(topic.value.trim())
     sessionId.value = session_id
-    // 2. 建立 WebSocket 并启动授课
+    // 2. 新课堂：清空上一堂课的本地展示状态，避免新旧课堂消息/阶段混在一起
+    socket.value?.close()
+    messages.value = []
+    alerts.value = []
+    currentPhase.value = ''
+    currentRound.value = 0
+    // 3. 建立 WebSocket 并启动授课
     connectSocket(session_id)
   } catch (err) {
     ElMessage.error(err.message || '创建会话失败')
@@ -144,6 +152,7 @@ async function handleStart() {
 
 function connectSocket(sessionId) {
   socket.value?.close()
+  startSent = false
   socket.value = new ClassroomSocket(sessionId, {
     onMessage: (data) => {
       // 学生/仲裁器消息也带有后端回填的 round/phase；收到即更新状态栏
@@ -172,11 +181,14 @@ function connectSocket(sessionId) {
     },
     onStatus: (state) => {
       connState.value = state
+      // 连接就绪后再发送开始授课指令：避免固定 setTimeout 在慢网络下早于 onopen 而丢失 start
+      if (state === 'connected' && !startSent) {
+        startSent = true
+        socket.value.sendStart()
+      }
     },
   })
   socket.value.connect()
-  // 连接建立后发送开始授课指令
-  setTimeout(() => socket.value.sendStart(), 300)
 }
 
 function scrollToBottom() {
