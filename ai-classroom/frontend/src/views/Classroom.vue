@@ -94,6 +94,9 @@
 
     <!-- 学情档案：收到 profile 帧后展示（后端在 end 帧之前下发） -->
     <ProfileCard v-if="profile" :profile="profile" class="profile-panel" />
+
+    <!-- Agent 工具演示（按需点击，不参与课堂自动流程，避免额外 LLM 调用） -->
+    <ToolAgentPanel ref="toolAgentRef" />
   </div>
 </template>
 
@@ -103,6 +106,7 @@ import { ElMessage } from 'element-plus'
 import MessageBubble from '../components/MessageBubble.vue'
 import QuizPanel from '../components/QuizPanel.vue'
 import ProfileCard from '../components/ProfileCard.vue'
+import ToolAgentPanel from '../components/ToolAgentPanel.vue'
 import ClassroomSocket from '../websocket/index.js'
 import { startClassroom } from '../api/index.js'
 import { fallbackStudentName, formatDuration, phaseLabel } from '../utils/format.js'
@@ -120,6 +124,8 @@ const currentPhase = ref('')
 const currentRound = ref(0)
 const ended = ref(false)
 const chatListRef = ref(null)
+// Agent 工具演示面板：新课堂开始时通过 reset() 清空上一次的演示结果
+const toolAgentRef = ref(null)
 // 是否自动跟随到底部：用户向上回看历史时暂停自动滚动，滚回底部后恢复
 const autoFollow = ref(true)
 
@@ -351,6 +357,8 @@ function resetClassroomState() {
   currentRound.value = 0
   ended.value = false
   autoFollow.value = true
+  // 清空上一堂课的 Agent 工具演示结果（面板工具列表缓存保留，避免重复请求）
+  toolAgentRef.value?.reset()
 }
 
 /** 创建会话并连接 WebSocket，随后发送"开始授课"指令 */

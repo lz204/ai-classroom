@@ -83,3 +83,25 @@ export function cleanOptionText(option, index) {
   const stripped = text.replace(prefixed, '').trim()
   return stripped || text
 }
+
+/**
+ * 毫秒 → 可读耗时（Agent 工具面板：单步 elapsed_ms / 整体耗时）。
+ * <1s 显示 "820 ms"，否则显示 "1.25 s"。
+ */
+export function formatMilliseconds(value) {
+  if (value == null || value === '') return '-'
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return '-'
+  if (n < 1000) return `${Math.round(n)} ms`
+  return `${(n / 1000).toFixed(2)} s`
+}
+
+/**
+ * 长文本截断（Agent trace 的 observation / args 展示用），保留完整内容由调用方放 title。
+ */
+export function truncateText(value, maxLength = 200) {
+  const text = String(value ?? '')
+  const limit = Number(maxLength)
+  if (!Number.isFinite(limit) || limit <= 0 || text.length <= limit) return text
+  return `${text.slice(0, limit)}…`
+}
