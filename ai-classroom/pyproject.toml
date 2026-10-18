@@ -1,0 +1,41 @@
+# ============================================================
+# 单仓多语言工程配置（Python：pytest / ruff / coverage）
+# 使用位置：仓库 ai-classroom/ 目录（pytest、ruff、coverage 均从该目录执行）
+#   cd ai-classroom
+#   ..\\.venv\\Scripts\\python.exe -m pytest -q
+#   ..\\.venv\\Scripts\\python.exe -m ruff check backend
+# ============================================================
+
+[tool.pytest.ini_options]
+# 异步测试无需逐个加 @pytest.mark.asyncio（tests/test_smoke.py 为 async def 风格）
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# 测试目录与模块搜索路径（backend 下模块以顶层名导入，如 import config / import store）
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
+addopts = "-q"
+
+[tool.ruff]
+# 与 CI 保持一致：ruff check backend
+line-length = 100
+target-version = "py311"
+# 评测报告是生成物，不参与 lint
+extend-exclude = ["backend/eval/reports"]
+
+[tool.ruff.lint]
+# 采用 Python 常用基础规则集（pycodestyle 错误/警告 + pyflakes），避免为风格问题改动业务代码
+select = ["E4", "E7", "E9", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# 既有代码 backend/rag/ingest.py 第 13 行 import os 未使用（本任务不修改业务代码，仅局部豁免）
+"backend/rag/ingest.py" = ["F401"]
+
+[tool.coverage.run]
+# 覆盖率统计范围：backend 应用代码（相对 ai-classroom/ 执行）
+source = ["backend"]
+# 测试代码与评测脚本不属于应用代码，不计入覆盖率
+omit = ["backend/tests/*", "backend/eval/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

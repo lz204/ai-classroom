@@ -1,0 +1,12 @@
+# ============================================================
+# 开发/测试依赖（仅本地与 CI 使用；运行时依赖见 backend/requirements.txt）
+# 安装：pip install -r backend/requirements-dev.txt
+# 本地验证版本：pytest 9.1.1 / pytest-asyncio 1.4.0 / pytest-cov 7.1.0 / ruff 0.17.1
+# ============================================================
+# 测试框架与异步测试支持（backend 下 async 测试为原生 async def 风格）
+pytest>=8.2,<10
+pytest-asyncio>=0.24,<2
+# 覆盖率统计
+pytest-cov>=5.0,<8
+# 代码静态检查（配置见 ai-classroom/pyproject.toml）
+ruff>=0.6,<1

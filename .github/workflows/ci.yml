@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: 后端（ruff + pytest 覆盖率 + 评测）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-classroom
+    env:
+      # 不依赖 secrets / .env / Redis / 向量索引：测试与评测全部走 Mock，缺失时 SKIP 不失败
+      LLM_API_KEY: ""
+      REDIS_URL: ""
+      VECTOR_INDEX_PATH: ${{ github.workspace }}/ai-classroom/_no_index_for_ci
+      STREAM_INTERVAL_SECONDS: "0"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai-classroom/backend/requirements.txt
+            ai-classroom/backend/requirements-dev.txt
+
+      - name: 安装依赖（运行时 + 开发/测试）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: Ruff 静态检查（配置见 ai-classroom/pyproject.toml）
+        run: ruff check backend
+
+      - name: pytest（含覆盖率）
+        run: pytest --cov --cov-report=term-missing
+
+      - name: RAG 检索评测（向量索引不存在时打印 SKIP，不失败）
+        run: python backend/eval/rag_eval.py
+
+      - name: Agent/Tool 评测（Mock LLM，不联网）
+        run: python backend/eval/agent_eval.py
+
+      - name: 上传评测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-eval-reports
+          path: ai-classroom/backend/eval/reports/
+          if-no-files-found: ignore
+
+  frontend:
+    name: 前端（npm ci + build）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-classroom/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ai-classroom/frontend/package-lock.json
+
+      - name: 安装依赖（严格按 lockfile）
+        run: npm ci
+
+      - name: 构建前端
+        run: npm run build

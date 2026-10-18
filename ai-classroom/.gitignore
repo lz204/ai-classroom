@@ -10,6 +10,13 @@ __pycache__/
 .venv/
 venv/
 
+# 测试 / 覆盖率 / 静态检查缓存
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+
 # 模型缓存与向量索引（体积大，不入库）
 models/
 knowledge_base/faiss_index/

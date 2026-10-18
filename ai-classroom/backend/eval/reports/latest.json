@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-10-19T02:29:32+08:00",
+  "elapsed_seconds": 35.572,
+  "env": {
+    "python": "3.13.0",
+    "platform": "Windows AMD64"
+  },
+  "rag": {
+    "status": "ok",
+    "reason": null,
+    "metrics": {
+      "hit_rate": 1.0,
+      "mrr": 0.9563,
+      "risk_no_evidence_rate": 0.95,
+      "top_k": 4,
+      "reranker_enabled": false,
+      "count": 60
+    }
+  },
+  "agent": {
+    "status": "ok",
+    "reason": null,
+    "metrics": {
+      "success_rate": 1.0,
+      "tool_call_success_rate": 1.0,
+      "avg_steps": 2.25,
+      "p95_latency_ms": 0.55,
+      "degraded_count": 1,
+      "task_count": 20
+    }
+  }
+}
