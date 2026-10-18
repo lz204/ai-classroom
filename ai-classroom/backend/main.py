@@ -5,20 +5,29 @@
 """
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 import classroom
-from api.routes import router
+from api.routes import close_agent, router
 
-app = FastAPI(title="AI Classroom 多智能体互动教学课堂")
 
-# 允许前端跨域（Vite 开发端口 5173 等）
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """应用生命周期：关闭时释放 ToolAgent 的 MCP 子进程等资源。"""
+    yield
+    await close_agent()
+
+
+app = FastAPI(title="AI Classroom 多智能体互动教学课堂", lifespan=lifespan)
+
+# 允许前端跨域（Vite 开发端口 5173 等）；本服务不使用 Cookie 凭据，因此 credentials=False
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

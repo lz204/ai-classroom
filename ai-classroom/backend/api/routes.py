@@ -22,9 +22,13 @@ async def health():
 @router.post("/classroom/start")
 async def start_classroom(req: StartRequest):
     """创建课堂会话，返回 session_id（前端随后通过 WebSocket 连接并启动授课）"""
-    if not req.topic.strip():
+    topic = req.topic.strip()
+    if not topic:
         raise HTTPException(status_code=400, detail="授课主题不能为空")
-    session = classroom.create_session(req.topic.strip())
+    if len(topic) > 200:
+        # 输入上限：避免超长主题拼进 Prompt 造成 token 成本放大与注入面扩大
+        raise HTTPException(status_code=400, detail="授课主题过长（最多 200 字符）")
+    session = classroom.create_session(topic)
     return {"session_id": session.session_id, "topic": session.topic}
 
 
@@ -60,3 +64,69 @@ async def classroom_profile(session_id: str):
     if profile is None:
         raise HTTPException(status_code=404, detail="学情档案尚未生成或会话不存在")
     return profile
+
+
+# ============ Tool-Use Agent 演示接口（Function Calling + MCP） ============
+class AgentAskRequest(BaseModel):
+    """工具 Agent 请求体"""
+
+    question: str
+    context: str = ""
+
+
+# ToolAgent 单例：首次调用时初始化（会按需加载 RAG 检索器并连接 MCP Server）
+_tool_agent = None
+
+
+def _get_tool_agent():
+    global _tool_agent
+    if _tool_agent is None:
+        from tool_agent import ToolAgent
+
+        _tool_agent = ToolAgent()
+    return _tool_agent
+
+
+@router.get("/agent/tools")
+async def agent_tools():
+    """列出 Tool-Use Agent 可用工具（本地工具 + 通过 MCP 动态注册的工具）"""
+    try:
+        agent = _get_tool_agent()
+        # 首次查看工具时先懒连接 MCP Server，否则只能看到本地工具；连接失败自动降级不抛错
+        try:
+            await agent.ensure_mcp(True)
+        except Exception:
+            pass
+        return {
+            "tools": agent.list_tools(),
+            "mcp_connected": bool(getattr(agent, "mcp_connected", False)),
+        }
+    except Exception as exc:  # 初始化失败（如检索器/模型不可用）返回 503，不影响课堂主流程
+        raise HTTPException(status_code=503, detail=f"ToolAgent 初始化失败：{exc!r}") from exc
+
+
+async def close_agent():
+    """应用关闭时释放 ToolAgent 的 MCP 子进程等资源（供 FastAPI lifespan 调用）。"""
+    global _tool_agent
+    agent, _tool_agent = _tool_agent, None
+    if agent is not None:
+        try:
+            await agent.aclose()
+        except Exception:
+            pass
+
+
+@router.post("/agent/ask")
+async def agent_ask(req: AgentAskRequest):
+    """让 Tool-Use Agent 执行一次「推理 → 工具调用 → 观察」循环并返回轨迹。
+
+    返回：{answer, trace, steps, degraded, mcp_connected, tools_used}
+    """
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+    try:
+        agent = _get_tool_agent()
+        return await agent.ask(question, context=req.context)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"ToolAgent 执行失败：{exc!r}") from exc

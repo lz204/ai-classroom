@@ -30,6 +30,16 @@ class LLMClient:
         """调用 LLM，返回文本内容（真实模式取 message.content，Mock 模式返回模拟 JSON）"""
         raise NotImplementedError
 
+    async def chat_with_tools(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict:
+        """带工具（Function Calling）的一轮对话，供 Tool-Use Agent 使用。
+
+        :return: {"content": str | None, "tool_calls": [{"id", "name", "arguments"}]}
+                 arguments 为 JSON 字符串（与 OpenAI 协议一致）
+        """
+        raise NotImplementedError
+
 
 class OpenAIClient(LLMClient):
     """真实 LLM 客户端（OpenAI 兼容协议）"""
@@ -56,6 +66,42 @@ class OpenAIClient(LLMClient):
         )
         return resp.choices[0].message.content or ""
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=8),
+        retry=retry_if_exception_type((RateLimitError, APIConnectionError, TimeoutError)),
+    )
+    async def chat_with_tools(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict:
+        """Function Calling：把 tool_calls 归一化为 {id, name, arguments(JSON 字符串)}。"""
+        kwargs: dict = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        resp = await asyncio.wait_for(
+            self._client.chat.completions.create(**kwargs),
+            timeout=self._timeout,
+        )
+        message = resp.choices[0].message
+        tool_calls = []
+        for idx, call in enumerate(getattr(message, "tool_calls", None) or []):
+            function = getattr(call, "function", None)
+            if function is None:
+                continue
+            tool_calls.append(
+                {
+                    "id": getattr(call, "id", None) or f"call_{idx}",
+                    "name": function.name or "",
+                    "arguments": function.arguments or "{}",
+                }
+            )
+        return {"content": message.content, "tool_calls": tool_calls}
+
 
 # ============ 内置 Mock LLM ============
 # 以下正则用于从各 Agent 的 Prompt 中提取角色与身份标记
@@ -75,6 +121,31 @@ _RE_OPTION_LINE = re.compile(r"^[ \t]*([A-D])[.、)]\s*(.+?)[ \t]*$", re.MULTILI
 # 选项下标 -> 字母
 _OPTION_LETTERS = ("A", "B", "C", "D")
 
+# ---- Tool-Use（Mock Function Calling）触发词 / 算式提取 ----
+_RE_TOOL_CALC = re.compile(r"计算|算一下|算一算|求值|等于多少|结果是多少")
+# 连续算式片段（数字/四则/幂/括号），用于从自然语言里提取表达式
+_RE_TOOL_CALC_RUN = re.compile(r"[0-9+\-*/%(). ]+")
+_RE_TOOL_KB = re.compile(r"极限|连续|导数|积分|定理|知识库|教材|概念")
+_RE_TOOL_TIME = re.compile(r"几点|现在时间|当前时间|今天几号|日期")
+# 中文/全角符号 -> ASCII 算式符号
+_RE_TOOL_TRANSLATION = str.maketrans(
+    {"×": "*", "÷": "/", "（": "(", "）": ")", "－": "-", "＋": "+", "^": "**"}
+)
+
+
+def _extract_expression(text: str) -> str | None:
+    """从自然语言中提取最长的算式片段（不足则返回 None）。"""
+    normalized = text.translate(_RE_TOOL_TRANSLATION)
+    candidates = [
+        run.strip()
+        for run in _RE_TOOL_CALC_RUN.findall(normalized)
+        if any(ch.isdigit() for ch in run)
+    ]
+    if not candidates:
+        return None
+    expression = max(candidates, key=len).strip(" +-*/%")
+    return expression or None
+
 
 class MockLLM(LLMClient):
     """内置 Mock LLM：根据 Prompt 中的角色标记返回结构化的模拟 JSON，用于无 Key 演示"""
@@ -87,6 +158,79 @@ class MockLLM(LLMClient):
         # 模拟真实 LLM 的少量网络延迟，让前端时序更接近真实
         await asyncio.sleep(0.3)
         return self._build_response(prompt)
+
+    # ---------- Tool-Use（Function Calling）Mock ----------
+    async def chat_with_tools(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict:
+        """确定性的 Mock Function Calling，保证 ToolAgent 单测不依赖网络/真实 API。
+
+        规则：
+        - messages 里已有 role=tool 的结果 -> 返回最终回答（不再调用工具）；
+        - 用户问题含「计算/算一下...」-> 返回 calculate tool_call（自动提取算式）；
+        - 含「极限/连续/知识库/教材...」-> 返回 search_knowledge_base tool_call；
+        - 含「几点/当前时间...」-> 返回 get_current_time tool_call；
+        - 其它 -> 直接返回最终回答。
+        """
+        await asyncio.sleep(0)  # 保持异步语义但不加延迟，测试快速
+        available = set()
+        for tool in tools or []:
+            function = (tool or {}).get("function") or {}
+            name = function.get("name")
+            if name:
+                available.add(name)
+        if not available:
+            available = {"calculate", "search_knowledge_base", "text_stats"}
+
+        # 已经有工具执行结果：生成最终回答（模拟 ReAct 的 Final Answer 阶段）
+        tool_messages = [m for m in messages if (m or {}).get("role") == "tool"]
+        if tool_messages:
+            observation = tool_messages[-1].get("content") or ""
+            return {"content": f"根据工具执行结果：{observation}", "tool_calls": []}
+
+        question = ""
+        for message in reversed(messages or []):
+            if (message or {}).get("role") == "user":
+                question = str(message.get("content") or "")
+                break
+
+        if _RE_TOOL_CALC.search(question):
+            expression = _extract_expression(question)
+            if expression and "calculate" in available:
+                return self._mock_tool_call(
+                    "calculate", {"expression": expression}, "call_mock_1"
+                )
+            # 触发词但提取不到算式：直接回答，避免无意义的工具循环
+            return {
+                "content": f"（Mock 回答）请提供具体算式，例如 12*3+5。原问题：{question[:80]}",
+                "tool_calls": [],
+            }
+        if _RE_TOOL_KB.search(question) and "search_knowledge_base" in available:
+            return self._mock_tool_call(
+                "search_knowledge_base",
+                {"query": question[:120], "top_k": 3},
+                "call_mock_2",
+            )
+        if _RE_TOOL_TIME.search(question) and "get_current_time" in available:
+            return self._mock_tool_call("get_current_time", {}, "call_mock_3")
+        return {
+            "content": f"（Mock 直接回答）关于「{question[:80]}」：这是一个示例回答。",
+            "tool_calls": [],
+        }
+
+    @staticmethod
+    def _mock_tool_call(name: str, arguments: dict, call_id: str) -> dict:
+        """构造一次 tool_call（OpenAI 协议风格：arguments 为 JSON 字符串）"""
+        return {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                }
+            ],
+        }
 
     def _build_response(self, prompt: str) -> str:
         """根据角色标记构造对应 JSON 输出"""

@@ -1,7 +1,7 @@
 # AI Classroom 常用命令（Windows 下请在 Git Bash / PowerShell 中执行）
 # 环境：项目根目录
 
-.PHONY: install ingest up down dev-backend dev-frontend clean
+.PHONY: install ingest up down dev-backend demo-backend dev-frontend clean
 
 # 安装依赖
 install:
@@ -20,9 +20,13 @@ up:
 down:
 	docker-compose down
 
-# 开发模式：后端
+# 开发模式：后端（--reload 热更新；注意 Windows 下该模式会切换 SelectorEventLoop，MCP 子进程不可用、自动降级为本地工具）
 dev-backend:
 	cd backend && uvicorn main:app --reload --port 8000
+
+# 演示模式：后端（无 --reload，保留 ProactorEventLoop，Tool-Use Agent 的 MCP Server 可正常工作）
+demo-backend:
+	cd backend && python -m uvicorn main:app --port 8000
 
 # 开发模式：前端
 dev-frontend:

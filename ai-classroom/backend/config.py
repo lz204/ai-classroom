@@ -66,3 +66,13 @@ STREAM_INTERVAL_SECONDS = float(os.getenv("STREAM_INTERVAL_SECONDS", "0.02"))
 # ============ 持久化 ============
 # 会话元数据 / 消息缓冲 / 学情档案在 Redis（或进程内降级）中的 TTL（秒）
 CLASSROOM_TTL = int(os.getenv("CLASSROOM_TTL", "3600"))
+
+# ============ Tool-Use Agent / MCP ============
+# Tool-Use Agent：最大「推理-行动」步数、单工具超时、整体超时（秒）
+TOOL_AGENT_MAX_STEPS = int(os.getenv("TOOL_AGENT_MAX_STEPS", "6"))
+TOOL_CALL_TIMEOUT = float(os.getenv("TOOL_CALL_TIMEOUT", "10"))
+TOOL_AGENT_TIMEOUT = float(os.getenv("TOOL_AGENT_TIMEOUT", "60"))
+# MCP：是否启用、Server 启动命令（留空则用 `python -m mcp_server`，工作目录 backend/）
+ENABLE_MCP = _get_bool("ENABLE_MCP", True)
+MCP_SERVER_CMD = os.getenv("MCP_SERVER_CMD", "").strip()
+MCP_TIMEOUT = float(os.getenv("MCP_TIMEOUT", "10"))
