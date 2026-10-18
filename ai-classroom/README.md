@@ -20,7 +20,7 @@ Vue3 + Vite ──REST / WebSocket──► FastAPI 后端 ──► LangGraph S
 ```
 
 - **后端**：FastAPI 提供 REST 接口（会话创建 / 状态查询 / 学情档案查询）与 WebSocket 实时推送；课堂会话、LangGraph 状态机、消息缓冲与学情档案由 `classroom.py` / `store.py` 统一管理。
-- **编排**：LangGraph `StateGraph` 共 5 类节点 `teacher / student / arbiter / ta / manager`；条件路由以单调递增的 `round` 计数为唯一依据，`phase` 仅用于前端展示，避免课堂顺序来回跳变。课堂固定 7 轮（r1 讲解、r2 测验+作答、r3 讲评+追问、r4 分组研讨、r5 批改、r6 布置作业+学情总结、r7 学情总结）；告警由 manager 处理完后按 `resume_target` 回到原定节点，**不会吞掉轮次**（实测全部学生超时场景老师仍为 7 轮）。
+- **编排**：LangGraph `StateGraph` 共 5 类节点 `teacher / student / arbiter / ta / manager`；条件路由以单调递增的 `round` 计数为唯一依据，`phase` 仅用于前端展示，避免课堂顺序来回跳变。课堂固定 7 轮（r1 讲解、r2 测验+作答、r3 讲评+追问、r4 分组研讨、r5 批改、r6 布置作业+学情总结、r7 学情总结）。属**固定工作流编排**（节点与路由由代码固定，LLM 只负责内容生成），不等同于自主 Agent。告警由 manager 处理完后按 `resume_target` 回到原定节点，**不会吞掉轮次**（回归测试 `tests/test_smoke.py` 第 7 组可复现：全部学生超时场景老师仍为 7 轮）。
 - **RAG**：`backend/rag/ingest.py` 解析教材（txt / md / pdf / docx）并建 FAISS 索引；检索时 FAISS 向量召回 + BM25 关键词召回（jieba 分词）混合去重，重排模型未缓存时自动跳过，空检索时课堂照常进行。
 - **随堂测验**：r2 老师随消息发布结构化 `quiz`（4 个选项、`answer_index` 0-3、`knowledge_point`、`quiz_id`），r2 学生逐个作答并回传 `answer`（`student_id / quiz_id / choice_index / choice_text`），r5 助教批改（`target` 含题目、正确答案与学生作答），前端 `QuizPanel` 展示题目、各选项人数与学生作答，正确率在学情档案中展示。
 - **性格互补分组**：`backend/graph/grouping.py::build_groups` 按 expert+introvert、active+follower 互补配对，默认 2 组（`STUDENT_GROUP_COUNT`），讨论角度为「概念辨析 / 例题应用 / 拓展探究N」；r4 学生消息携带 `group` 字段，前端展示分组徽章。
@@ -31,7 +31,13 @@ Vue3 + Vite ──REST / WebSocket──► FastAPI 后端 ──► LangGraph S
 - **Redis 持久化（可选）**：`backend/store.py::SessionStore`，配置 `REDIS_URL` 时持久化会话状态 / 消息缓冲 / 学情档案 / 记忆快照，未配置或连接失败自动降级为进程内存储（打印 warning），TTL 默认 3600s（`CLASSROOM_TTL`，追加消息会续期）。
 - **WebSocket 断线续传**：前端 30s 心跳（`ping` / `pong`）；每条帧先入缓冲、再尝试推送，断线重连时携带 `last_msg_id`，后端只补发未收到的帧。`lastMsgId` 只在 `message_end` / `alert` / `end` / `error` / 旧 `message` 帧上推进，半条流式消息会在重连后从 `message_start` 重发，前端按 id 重置内容、不重影。补发与实时推送共用会话级 `asyncio.Lock` 串行化；「开始授课」指令幂等；会话不存在时服务端先 accept 再 close(4004)，前端停止自动重连（自动重连上限 5 次）。
 - **Mock LLM**：未配置 `LLM_API_KEY` 时自动降级为内置 Mock LLM，无 Key 也能跑通完整课堂流程（Mock 学生固定选 B 作答），便于本地演示与测试。
-- **代码规模（按非空行统计）**：后端 Python 共 3254 行（其中 tests 718 行：`test_smoke.py` 290 + `test_store.py` 428），核心约 2536 行；前端 `src` 共 1538 行。
+- **代码规模（按非空行统计）**：后端 Python 共 3258 行（其中 tests 718 行：`test_smoke.py` 290 + `test_store.py` 428），核心约 2540 行；前端 `src` 共 1538 行。
+
+## 开发方式与个人贡献
+
+- 项目 2026-08 有一个基于智谱 GLM 的原型版本；2026-10-19 使用 AI 编码助手重构为阿里百炼 DashScope/Qwen，并补齐 P0/P1 能力（断线续传、随堂测验、分组研讨、流式分帧、学情档案、Redis 持久化）。
+- 本人负责方案设计与技术选型、核心实现与联调、测试与性能自测、文档与部署配置验收；AI 用于编码加速与 Code Review 辅助，产出代码由本人逐模块阅读、修改并跑回归验证，可逐行讲解 / 现场修改复跑。
+- 前端基于 Vue3 + Vite + Element Plus。**Git 历史只覆盖 2026-10-19 的重构（5 个 commit）**，2026-08 的原型开发不在仓库历史中；Docker 配置已编写，但本机无 Docker，未实机部署验证。
 
 ## 目录结构
 
@@ -65,7 +71,7 @@ ai-classroom/
 │   │   ├── utils/format.js                 # 阶段 / 性格 / 时长 / 选项格式化
 │   │   └── websocket/index.js              # WS 封装（心跳 / 重连 / last_msg_id）
 │   ├── Dockerfile
-│   └── nginx.conf              # 生产镜像中的 Nginx 配置（静态资源 + API/WS 反向代理）
+│   └── nginx.conf              # Nginx 静态资源 + API/WS 反向代理配置
 ├── knowledge_base/             # 教材原始资料（示例教材：高等数学_极限与连续.txt）
 ├── docker-compose.yml          # backend + frontend + redis 一键部署（本机未验证）
 ├── Makefile                    # 常用命令
@@ -185,13 +191,12 @@ python tests/test_smoke.py     # 预期最后一行：ALL P0/P1 REGRESSION TESTS
 python tests/test_store.py     # 预期最后一行：ALL P1 STORE TESTS PASSED
 ```
 
-前端构建验证：`cd frontend && npm run build`（本机实测约 11s、1602 modules，构建通过）。
+前端构建验证：`cd frontend && npm run build`（本机 Vite 输出约 11.9s、1602 modules；产物 JS 约 1.0MB（gzip 约 344KB）/ CSS 约 368KB（gzip 约 50KB），构建通过）。
 
-性能基线（本机实测，注意 Mock 与真实 API 两种口径）：
+性能基线（本机实测；Mock 与真实 API 两种口径，复现命令见项目文档附录 B.9）：
 
-- **Mock（4 学生、25 条消息）**：关闭打字节奏 4.07s，`STREAM_INTERVAL_SECONDS=0.02` / 12 字每片时 10.19s；单堂课 199 个 WS 帧、消息缓冲约 30.8KB/堂。
-- **真实 API + RAG 全链路（P1 冒烟）**：阿里百炼 `qwen-plus` + 本地 FAISS 索引与 `bge-large-zh`（跳过重排模型），`STREAM_INTERVAL_SECONDS=0`（关闭打字节奏、纯测链路），4 学生完整课堂约 **162.5s / 25 次 LLM 调用 / 616 个 WS 帧**；老师 7 轮 phase 正确、r2 结构化测验解析成功、4 名学生作答全部正确（accuracy=1.0）、2 个互补分组、学情档案完整，RAG 引用命中教材章节（第1章 1.2/1.5、第2章 2.1/2.3 等）。单次全链路冒烟，未做系统压测；RAG embedding 为后台预热与课堂并发加载。
-- **注意**：Mock 的 199 帧/30.8KB 与真实 API + RAG 的 616 帧/162.5s 是两组不同口径的数据，不要混用。
+- **Mock（4 学生、25 条逻辑消息）**：关闭打字节奏 4.06s，`STREAM_INTERVAL_SECONDS=0.02` / 12 字每片时 9.98s；单堂课 192 个 WS 帧（25 start + 140 delta + 25 end + profile + end）、消息缓冲 30,775 B（约 30.8KB/堂）。
+- **真实 API + RAG 全链路（P1 单次冒烟）**：阿里百炼 `qwen-plus` + 本地 FAISS 索引与 `bge-large-zh`（跳过重排模型），`STREAM_INTERVAL_SECONDS=0`，4 学生完整课堂约 **162.5s / 25 次 LLM 调用 / 616 个 WS 帧**；老师 7 轮 phase 正确、r2 结构化测验解析成功、4 名学生作答全部正确（accuracy=1.0）、2 个互补分组、学情档案完整，RAG 引用命中教材章节（第1章 1.2/1.5、第2章 2.1/2.3 等）。**该组数据为本地单次冒烟、无留存日志、非统计结论**；Mock 与真实 API 口径不同，不要混用。
 
 ## API / WebSocket 协议简表
 
@@ -234,7 +239,7 @@ python tests/test_store.py     # 预期最后一行：ALL P1 STORE TESTS PASSED
 
 ## Docker 部署
 
-> **说明：本机没有 Docker，以下 Docker 配置未在本机验证**，仅做过 YAML 语法与静态路径检查。首次构建镜像会下载全部 Python / Node 依赖，耗时较长。
+> **说明：本机没有 Docker，以下 Docker 配置未在本机验证、未实机部署**，仅做过 YAML 语法与静态路径检查。首次构建镜像会下载全部 Python / Node 依赖，耗时较长。
 
 前置条件：安装 Docker（Docker Desktop 或 Docker Engine + Compose v2，`docker compose version` 可用；旧版命令为 `docker-compose`）。
 
@@ -299,6 +304,7 @@ docker compose up -d          # 旧版 Docker：docker-compose up -d
 - 举手 / 发言队列是调度器内部按「性格优先级 + 先来先到」排序学生发言（`SpeakerQueue`），并非真实学生的自主举手请求。
 - 暂无鉴权、多班级、权限体系，定位为 Demo 演示，不建议直接用于真实教学场景；Docker 配置未在本机验证（本机无 Docker）。
 - Mock 模式下学生固定选 B、学情档案数据为模拟值，不代表真实模型表现。
+- 多智能体为**固定工作流编排**（**非自主 Agent**：节点与 `round` 路由由代码固定，LLM 只生成内容、不自主决定拓扑），不等同于 AutoGPT 类系统。
 
 ## 相关文档
 

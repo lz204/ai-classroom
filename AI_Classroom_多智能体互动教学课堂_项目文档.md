@@ -1,12 +1,13 @@
 # AI Classroom 多智能体互动教学课堂
 
 > 项目技术文档
-> 版本：v1.1（P1 功能与数据对齐） ｜ 更新日期：2026-10-19
+> 版本：v1.2（P2 表述与数据口径修复） ｜ 更新日期：2026-10-19
 
 ---
 
 ## 目录
 
+0. [面试速览（1 分钟版）](#0-面试速览1-分钟版)
 1. [项目概述](#一项目概述)
 2. [技术栈选型](#二技术栈选型)
 3. [系统架构设计](#三系统架构设计)
@@ -17,6 +18,19 @@
 8. [项目性能自测数据](#八项目性能自测数据)
 9. [项目亮点](#九项目亮点)
 10. [项目演进与优化方向](#十项目演进与优化方向)
+
+---
+
+## 0. 面试速览（1 分钟版）
+
+- **项目定位**：LLM 应用 / 多智能体工作流编排 + RAG 工程 Demo（LangGraph 状态机 + FAISS/BM25 + FastAPI/WebSocket + Vue3），属于「工作流编排式多智能体」，不是自主（autonomous）Agent，也不是通用 Agent 框架。
+- **3 个可验证亮点**：
+  1. **7 轮课堂状态机**：`round` 单调路由 + manager 告警 `resume_target` 回跳；回归测试可复现「全部学生超时告警下老师仍为 7 轮」（`tests/test_smoke.py` 第 7 组）。
+  2. **断线续传一致性修复**：帧先入缓冲再发送、`last_msg_id` 去重补发、`_send_lock` 串行化；回归测试覆盖「补发只发当前连接 / 补发与实时推送不乱序 / 发送异常不中止课堂 / 半条流式消息重发不重影」。
+  3. **`SessionStore` 存储降级**：Redis 可选 + 进程内降级 + TTL / 续期 / `purge_expired`，11 项存储单测覆盖成功、失败与降级路径。
+- **3 个边界（先讲清楚，避免被追问翻车）**：① 非自主 Agent——节点与路由由代码固定，LLM 只生成内容；② 单客户端 Demo——同一 `session_id` 仅保留最近一个 WS 连接，无鉴权 / 多班级；③ Docker Compose 配置已编写，但**本机无 Docker，未实机部署验证**。
+- **2 分钟演示**：`cd backend && python tests/test_smoke.py`（Mock 离线跑完 8 组回归）→ 起后端 `uvicorn main:app --reload --port 8000` + 前端 `npm run dev` → 浏览器输入主题点「开始授课」，观察 7 轮消息、随堂测验面板与学情档案。
+- **简历一句话**：基于 LangGraph 的多智能体互动课堂 Demo：7 轮教学状态机 + FAISS/BM25 混合 RAG + WebSocket 消息级流式与断线续传 + Redis 可降级会话存储；Mock 回归 8 组 + 存储单测 11 项可离线复跑。
 
 ---
 
@@ -38,7 +52,7 @@
 | 目标 | 说明 |
 |------|------|
 | 多角色协同 | AI 主讲老师、助教、多名性格差异化学生智能体、课堂管理员协同工作 |
-| 全流程闭环 | 线上直播授课 → 随堂提问 → 随堂测验（出题 / 作答 / 讲评 / 批改）→ 性格互补分组研讨 → 作业布置 → 学情档案 |
+| 全流程闭环 | 直播式授课（Demo）→ 随堂提问 → 随堂测验（出题 / 作答 / 讲评 / 批改）→ 性格互补分组研讨 → 作业布置 → 学情档案 |
 | 内容可控 | 授课内容优先依托 RAG 知识库生成并标注引用，空检索时明确约束不编造教材引用 |
 | 秩序管控 | 走神提醒、发言队列排序、单环节 / 整堂课超时限制，告警不吞教学轮次 |
 
@@ -46,17 +60,17 @@
 
 - **技术深度**：覆盖多智能体通信冲突、任务编排、角色边界管控等前沿难题；
 - **场景稀缺**：市面极少多 Agent 课堂场景实现，具备差异化竞争力；
-- **工程闭环**：从智能体调度到前端交互、Docker 云端部署的完整工程链路。
+- **工程闭环**：智能体调度 → 前端交互 → Docker Compose 本地部署配置（语法与静态路径已验证，未实机部署）。
 
 ### 1.4 个人职责与代码实现
 
-本人独立完成本项目的方案设计与编码实现（前端 Vue3 页面样式与静态资源除外），核心代码产出如下（行数按**非空行**统计）：
+本人负责本项目的方案设计、核心实现、测试与调试验收；开发过程中使用 AI 编码助手加速（开发方式与贡献边界见 1.5）。核心代码产出如下（行数按**非空行**统计）：
 
 | 模块 | 文件 | 代码量 | 主要工作 |
 |------|------|--------|----------|
 | LangGraph 编排层 | `graph/workflow.py`、`graph/state.py` | workflow.py 432 行 | 定义 `ClassroomState` 状态字段与合并 reducer，编写 `route_by_phase` / `_route_target_for_round` 条件路由，编排 teacher / student / arbiter / ta / manager 5 类节点，实现 7 轮教学闭环、告警 `resume_target` 回跳与环节 / 整堂课超时检查 |
 | 随堂测验与分组 | `graph/workflow.py`、`graph/grouping.py` | grouping.py 101 行 | r2 老师发布结构化 quiz、r2 学生并发作答、r3 讲评、r5 助教批改；r4 按性格互补调用 `build_groups` 分组并写入记忆 |
-| 会话与流式推送 | `classroom.py` | 296 行 | 课堂会话生命周期、`message_start / delta / end` 流式分帧、学情档案 finalize 与 `profile` 帧下发、`_send_lock` 串行化、断线补发与发送异常兜底 |
+| 会话与流式推送 | `classroom.py` | 300 行 | 课堂会话生命周期、`message_start / delta / end` 流式分帧、学情档案 finalize 与 `profile` 帧下发、`_send_lock` 串行化、断线补发与发送异常兜底 |
 | 学情档案 | `analytics.py` | 175 行 | `LearningProfile` 规则统计：学生发言 / 提问 / 答题 / 正确 / 超时 / 分组、课堂互动、测验正确率、知识点与薄弱点，`finalize()` 输出结构化档案 |
 | 持久化存储 | `store.py` | 265 行 | `SessionStore`：Redis 持久化 + 进程内降级、TTL 与续期、`classroom:{session_id}:{meta\|profile\|messages}` key 约定、`purge_expired` |
 | RAG 检索服务 | `rag/ingest.py`、`rag/retriever.py` | ingest.py 131 行、retriever.py 123 行 | 教材解析（txt / md / pdf / docx）与章节元数据、FAISS 索引构建、FAISS + BM25（jieba 分词）混合检索、可选 cross-encoder 重排与空检索兜底 |
@@ -65,7 +79,18 @@
 | LLM 客户端 | `llm_client.py` | 181 行 | OpenAI 兼容客户端（DashScope，tenacity 指数退避）与内置 Mock LLM 双模式 |
 | 前端 | `frontend/src` | 1538 行 | 课堂界面（流式气泡、打字机光标）、随堂测验面板、学情档案卡片、WS 封装与 `last_msg_id` 断线续传 |
 
-后端 Python 共 **3254 行**（其中 `tests/` 718 行：`test_smoke.py` 290 + `test_store.py` 428），核心业务代码约 **2536 行**；前端 `src` 共 **1538 行**。P1 新增模块包括 `analytics.py`、`store.py`、`graph/grouping.py`，以及前端 `QuizPanel.vue`、`ProfileCard.vue`、`composables/useMessageStream.js`、`utils/format.js`；上述代码全部由本人编写与调试。
+后端 Python 共 **3258 行**（其中 `tests/` 718 行：`test_smoke.py` 290 + `test_store.py` 428），核心业务代码 **2540 行**；前端 `src` 共 **1538 行**。P1 新增模块包括 `analytics.py`、`store.py`、`graph/grouping.py`，以及前端 `QuizPanel.vue`、`ProfileCard.vue`、`composables/useMessageStream.js`、`utils/format.js`。上述代码由本人主导实现并逐模块验收（AI 辅助说明见 1.5）。
+
+### 1.5 开发方式与个人贡献
+
+本项目不是「从零手写」也不是「一键生成」：2026-08 先有一个基于智谱 GLM 的原型版本（RAG 索引、前端骨架等），2026-10-19 使用 AI 编码助手将其重构为阿里百炼 DashScope/Qwen，并补齐 P0（断线续传 / 阶段展示 / 打包路径）与 P1（随堂测验 / 互补分组 / 流式分帧 / 学情档案 / Redis 存储）能力。**Git 历史只覆盖 2026-10-19 这次重构（5 个 commit），2026-08 的原型开发不在仓库历史中。**
+
+- **本人负责**：方案设计与技术选型、核心模块实现与联调、回归测试与性能自测、文档与部署配置的验收；
+- **AI 编码助手**：用于代码生成加速与 Code Review 辅助（例如 7.7 的多连接补发 review 用例）；生成的代码由本人逐模块阅读、修改并跑回归验证；
+- **可讲解范围**：状态机路由、流式帧协议、断线续传一致性、`SessionStore` 降级、RAG 检索链路等均有代码与测试可核对，可现场修改并复跑测试；
+- **前端**：Vue3 + Element Plus 组件实现（课堂界面 / 测验面板 / 学情档案卡片）。
+
+如果面试需要，可以现场演示：跑回归测试 → 改一处路由或帧协议行为 → 再跑测试验证。
 
 ---
 
@@ -274,7 +299,7 @@ graph LR
 ```mermaid
 graph TD
     subgraph 课堂全流程
-        P1[线上直播授课]
+        P1[直播式授课（Demo）]
         P2[随堂提问]
         P3[随堂测验与作答]
         P4[性格互补分组研讨]
@@ -293,7 +318,7 @@ graph TD
 
 ### 5.2 模块说明
 
-#### 模块一：线上直播授课
+#### 模块一：直播式授课（Demo）
 
 - **触发方式**：教师通过 REST 创建会话，WebSocket 发送 `start` 指令（重复发送幂等）；
 - **执行流程**：主讲老师 Agent 调用 RAG 检索教材片段 → 按当前轮次环节描述生成授课内容 → 以 `message_start / delta / end` 流式分帧实时推送；
@@ -486,7 +511,7 @@ def route_after_manager(state: ClassroomState) -> str:
 
 > **order_alerts 清空机制**：`order_alerts` 非空时路由会优先跳转 `manager`（秩序干预），`manager_node` 处理完告警后**必须清空 `order_alerts` 字段**，否则路由会因告警始终非空而反复跳转 manager，形成 `manager → teacher → manager` 死循环；同时 manager 在 return 中写入 `resume_target`，把控制权交回「本轮原定应去的节点」。
 
-> **已修复：告警不再吞轮次**。旧实现中 manager 处理完告警固定回到 teacher、`round` 继续 +1，导致告警触发的课堂会跳过原本该执行的学生环节（`discuss` 轮也可能缺席）。现在 `manager_node` 用 `_route_target_for_round(round)` 计算被拦截的目标节点写入 `resume_target`，出边改为 `route_after_manager` 条件边：告警处理完回到原本应去的 `teacher / student / ta / END`，老师轮次始终为 7 轮。实测「全部学生超时」场景：alert 帧 16 条、manager 消息 5 条、teacher 消息仍为 7 条（round 1..7 连续）。
+> **已修复：告警不再吞轮次**。旧实现中 manager 处理完告警固定回到 teacher、`round` 继续 +1，导致告警触发的课堂会跳过原本该执行的学生环节（`discuss` 轮也可能缺席）。现在 `manager_node` 用 `_route_target_for_round(round)` 计算被拦截的目标节点写入 `resume_target`，出边改为 `route_after_manager` 条件边：告警处理完回到原本应去的 `teacher / student / ta / END`，老师轮次始终为 7 轮。回归测试（`test_smoke.py` 第 7 组）可复现「全部学生超时」场景：alert 帧 16 条、manager 消息 5 条、teacher 消息仍为 7 条（round 1..7 连续）。
 
 **为什么用条件边（conditional_edges）而非硬编码 if-else？**
 阶段流转规则集中在路由函数中，新增阶段时只需扩展枚举与路由映射，无需改状态机构建代码；同时 LangGraph 支持把状态图导出为 Mermaid，便于调试阶段跳转。
@@ -995,7 +1020,7 @@ services:
 
 #### 6.5.3 服务稳定性与异常处理
 
-线上跑课堂时遇到过 LLM 限流、WebSocket 断线等稳定性问题，做了如下容错处理：
+本地联调与真实 API 冒烟中观察到 LLM 限流、WebSocket 断线等稳定性问题（单次本地冒烟、无留存日志，非线上事故记录），针对这些问题设计并验证了如下容错处理：
 
 **1. LLM 调用重试（指数退避）**：阿里百炼 Qwen 通过 OpenAI 兼容接口接入（`base_url` 指向 DashScope 兼容端点），因此后端可统一捕获 OpenAI SDK 的 `RateLimitError` / `APIConnectionError`；遇到限流或连接错误时按 2s/4s/8s 指数退避重试 3 次，避免单个 Agent 卡死阻塞整个课堂。
 
@@ -1013,7 +1038,7 @@ async def llm_invoke(prompt: str) -> str:
     return await asyncio.wait_for(llm.ainvoke(prompt), timeout=LLM_TIMEOUT)
 ```
 
-**2. WebSocket 断线续传（先缓冲后发送 + last_msg_id 去重补发）**：实测发现连接刚断开时 ASGI 层的 `send` 可能不会立刻抛错，消息"看似发送成功"但客户端收不到。因此实现改为**每条帧先写入缓冲（SessionStore：配置 `REDIS_URL` 用 Redis，否则进程内实现，均带 TTL），再尝试推送**；前端重连时携带 `last_msg_id`，后端从缓冲中只补发 id 更大的帧。发送 / 补发统一捕获所有发送异常（断线时 Starlette 可能抛 `RuntimeError` / `WebSocketDisconnect` / `OSError`），失败只意味着帧留在缓冲里，不会中断课堂；单条发送加 5s 超时，避免半开连接把课堂卡死。
+**2. WebSocket 断线续传（先缓冲后发送 + last_msg_id 去重补发）**：实现排查与回归测试中发现连接刚断开时 ASGI 层的 `send` 可能不会立刻抛错，消息"看似发送成功"但客户端收不到。因此实现改为**每条帧先写入缓冲（SessionStore：配置 `REDIS_URL` 用 Redis，否则进程内实现，均带 TTL），再尝试推送**；前端重连时携带 `last_msg_id`，后端从缓冲中只补发 id 更大的帧。发送 / 补发统一捕获所有发送异常（断线时 Starlette 可能抛 `RuntimeError` / `WebSocketDisconnect` / `OSError`），失败只意味着帧留在缓冲里，不会中断课堂；单条发送加 5s 超时，避免半开连接把课堂卡死。
 
 ```python
 async def send_or_buffer(session, payload: dict, msg_id: int):
@@ -1046,9 +1071,9 @@ async def replay_missed(session, ws: WebSocket, last_msg_id: int):
             return  # 补发途中再次断线：帧仍在缓冲，下次重连按新的 last_msg_id 继续
 ```
 
-> **并发串行化**：`send_or_buffer` 与 `replay_missed` 共用 `session._send_lock`。若不加锁，重连补发期间新产生的帧会直接 `send` 插到旧帧前面（实测顺序为 `1,4,2,3`），既造成前端气泡乱序，又会让客户端按 `last_msg_id` 去重时永久漏掉旧帧；加锁后顺序恒为 `1,2,3,4`。另外 WS 端点的 `start` 指令用 `session.started` 做幂等保护，重复发送不会让课堂状态机再跑一遍；会话不存在时先 `accept` 再 `close(4004)`，前端据此停止自动重连。
+> **并发串行化**：`send_or_buffer` 与 `replay_missed` 共用 `session._send_lock`。若不加锁，重连补发期间新产生的帧会直接 `send` 插到旧帧前面（回归用例中复现顺序为 `1,4,2,3`），既造成前端气泡乱序，又会让客户端按 `last_msg_id` 去重时永久漏掉旧帧；加锁后顺序恒为 `1,2,3,4`。另外 WS 端点的 `start` 指令用 `session.started` 做幂等保护，重复发送不会让课堂状态机再跑一遍；会话不存在时先 `accept` 再 `close(4004)`，前端据此停止自动重连。
 
-> **缓冲与 TTL**：发送成功的帧也留在缓冲里，重连只按 `last_msg_id` 过滤，因此无论客户端刷新、多客户端补历史还是补发途中断线，都不会因为"快照被删除"而永久丢消息。缓冲由 `SessionStore` 统一存储，默认 TTL 为 `CLASSROOM_TTL`（3600s），每次追加消息会刷新该会话 messages / meta / profile 三个 key 的过期时间；课堂运行期间持续续期，结束且超过 TTL 后自动过期（Redis 侧由 Redis 过期，进程内侧由 `purge_expired` / 惰性删除清理）。单堂课（Mock、4 学生、25 条消息）共 199 帧、缓冲约 30.8KB。
+> **缓冲与 TTL**：发送成功的帧也留在缓冲里，重连只按 `last_msg_id` 过滤，因此无论客户端刷新、多客户端补历史还是补发途中断线，都不会因为"快照被删除"而永久丢消息。缓冲由 `SessionStore` 统一存储，默认 TTL 为 `CLASSROOM_TTL`（3600s），每次追加消息会刷新该会话 messages / meta / profile 三个 key 的过期时间；课堂运行期间持续续期，结束且超过 TTL 后自动过期（Redis 侧由 Redis 过期，进程内侧由 `purge_expired` / 惰性删除清理）。单堂课（Mock、4 学生、25 条逻辑消息）共 192 帧（25 `message_start` + 140 `message_delta` + 25 `message_end` + `profile` + `end`）、缓冲 30,775 B（约 30.8KB）。
 
 **3. RAG 检索降级**：检索器采用懒加载，索引缺失 / 模型不可用 / 加载异常时标记为不可用并返回空检索结果，课堂继续运行（老师基于通用知识讲解、citation 留空），不会因为 RAG 不可用导致服务崩溃；后端启动时另起后台线程预热 RAG（加载 embedding / FAISS / BM25 耗时较长），避免首个课堂请求阻塞事件循环。
 
@@ -1098,9 +1123,9 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
 
 #### 6.6.3 性能开销与边界
 
-- 帧数放大：Mock 全流程（4 学生、25 条逻辑消息）共产生 **199 帧**，消息缓冲约 **30.8KB/堂**；
-- 真实 API + RAG 全链路（P1 冒烟）：单堂共 **616 个 WS 帧**（真实模型消息内容远长于 Mock，分片数随之增加），耗时约 162.5s，详见第八章；
-- 耗时对比：同一 Mock 流程关闭打字节奏 **4.07s**，保持 0.02s / 12 字节奏 **10.19s**（耗时主要来自分片 sleep）；
+- 帧数放大：Mock 全流程（4 学生、25 条逻辑消息）共产生 **192 帧**（25 条 `message_start` + 140 条 `message_delta` + 25 条 `message_end` + `profile` + `end`），消息缓冲 **30,775 B**（约 30.8KB）/堂；
+- 真实 API + RAG 全链路（P1 单次冒烟）：单堂共 **616 个 WS 帧**（真实模型消息内容远长于 Mock，分片数随之增加），耗时约 **162.5s**；该组数据为**本地单次冒烟、无留存日志、非统计结论**，复现命令见附录 B.9；
+- 耗时对比：同一 Mock 流程关闭打字节奏 **4.06s**，保持 0.02s / 12 字节奏 **9.98s**（耗时主要来自分片 sleep）；
 - 属**消息级分片**：LLM 仍是整条生成后由后端切片推送，不是 token 级流式；真正的 token 级流式列为演进方向（见 10.1）。
 
 ### 6.7 学情档案与持久化
@@ -1153,11 +1178,11 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
 
 ## 七、技术攻坚与踩坑实录
 
-本章记录项目开发过程中实际遇到的 Bug 与解决过程，体现真实的工程调试能力。
+本章记录实现 / 自测 / Code Review 中处理过的问题与设计决策；7.2 / 7.4 为设计点说明，7.1 / 7.3 / 7.5 / 7.6 为问题处理记录，7.7 有对应提交（9e4113b）与回归用例；部分问题通过回归脚本构造复现，不等同于线上事故记录。
 
 ### 7.1 踩坑一：多 Agent 并发写入导致消息丢失
 
-- **现象（Bug）**：小组研讨环节，多个学生 Agent 并行调用 LLM 后返回的消息出现顺序错乱、部分学生回复直接丢失。日志里没有报错，但消息数量对不上。
+- **问题现象（实现自测中发现）**：小组研讨环节，多个学生 Agent 并行调用 LLM 后返回的消息出现顺序错乱、部分学生回复直接丢失。日志里没有报错，但消息数量对不上。
 - **排查过程**：打断点发现 LangGraph 的 State 对 `messages` 字段默认是**覆盖式写入**（后写的直接覆盖前面的），不是追加。最初实现是"学生群节点并行调用 LLM 后，把每个学生的回复各自作为 `{"messages": [单条消息]}` 返回"，LangGraph 按返回顺序逐条应用写入，最后写入的覆盖了前面的；且并行返回的顺序不可控，导致消息错乱丢失。
 - **我的解法**：
   1. 把 State 的 `messages` 字段改为 `Annotated[list, operator.add]`，让 LangGraph 自动做追加合并而不是覆盖；
@@ -1165,20 +1190,19 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
   3. 单个 Agent 超时（`asyncio.wait_for` 30s）不阻塞队列，记入 `order_alerts` 作为走神提醒。
 - **结果**：消息不再丢失，顺序严格按发言队列排序。
 
-### 7.2 踩坑二：RAG 检索返回前言/目录，正文丢失
+### 7.2 设计点：RAG 检索质量与章节元数据
 
-- **现象（Bug）**：提问"微积分基本定理"，检索返回的 chunks 全是前言和目录页，正文定义根本没召回。
-- **排查过程**：用 `RecursiveCharacterTextSplitter` 默认按 `\n\n` 切分，PDF 转 txt 时章节层级丢失，"第3章 微积分基本定理"这种标题和正文混在一起被切成碎片，向量检索时前言的高频词（"微积分""定理"）反而得分更高。
-- **我的解法**：
-  1. 改用 PyMuPDF 提取 PDF 时保留章节标题作为 `metadata`（`{"chapter": "第3章", "section": "3.2"}`）；
-  2. 分块时用 `RecursiveCharacterTextSplitter` 配合自定义分隔符（章节标题、换行符递归切分），保证一个知识点不被跨 chunk 切断；
-  3. 检索结果保留章节 metadata，并在参考内容里拼上章节号（`format_context`），便于溯源与前端展示；按章节过滤检索尚未实现（列为后续演进方向）；
-  4. 加入 BM25 关键词检索做混合，互补向量检索在"定理""公式"等专有名词上的盲区。
-- **结果**：正文定义类提问的召回明显改善，不再返回前言/目录碎片。
+- **背景**：知识库当前只有 1 份示例教材（42 行 / 7141 字节，索引后 10 chunks），检索质量完全由这一份语料决定；如果换成多份 PDF / 课件，切分与召回策略需要重新评估。
+- **做法**：
+  1. `rag/ingest.py` 用 PyMuPDF / python-docx 解析 pdf / docx、txt / md 直接读取，识别「第X章」「X.Y」标题并按章节写入 `metadata`（`chapter` / `section`）；`RecursiveCharacterTextSplitter`（chunk_size=500、overlap=50）按换行 / 句号 / 分号递归切分，尽量不跨章节切断知识点；
+  2. 检索侧 FAISS 向量召回 + BM25 关键词召回（jieba 分词）混合，按内容去重后取 top-k；`format_context` 把章节号拼进参考内容，便于前端 citation 溯源；
+  3. BM25 必须先中文分词：直接按字匹配会把「极限」「微分方程」等词拆散，检索效果明显变差；
+  4. 索引缺失 / 模型不可用时返回空检索，老师 Prompt 约束「无参考内容时不编造教材章节引用」。
+- **未做 / 局限（面试可主动说明）**：没有按章节过滤、没有相关性阈值、没有 RAG 离线评测（Hit Rate / MRR）；语料只有 1 份教材，覆盖面有限。本设计点只解决「分块 + 中文分词 + 混合召回 + 空检索兜底」，不宣称已解决检索准确率问题。
 
 ### 7.3 踩坑三：LLM 输出格式不合法导致前端渲染崩溃
 
-- **现象（Bug）**：前端 `JSON.parse(teacher_msg)` 偶发抛 `SyntaxError: Unexpected token`，导致整个对话面板白屏。查后端日志发现 LLM 返回的不是纯 JSON，前面带了"好的，以下是授课内容："这种前缀文本。
+- **问题现象（实现中处理）**：前端 `JSON.parse(teacher_msg)` 偶发抛 `SyntaxError: Unexpected token`，导致整个对话面板白屏。查后端日志发现 LLM 返回的不是纯 JSON，前面带了"好的，以下是授课内容："这种前缀文本。
 - **排查过程**：System Prompt 里写了"输出 JSON"，但 LLM（尤其 Qwen 等国产模型）有时会"礼貌性"加一句开场白再给 JSON，直接 `JSON.parse` 就崩了。
 - **我的解法**：
   1. 用 Pydantic 定义 `TeacherMessage` 模型做结构校验；
@@ -1187,19 +1211,19 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
   4. 仍失败则降级为兜底话术"老师授课生成异常，请重试"，不让前端白屏。
 - **结果**：前端不再因格式问题崩溃；格式错误率未做系统统计（旧文档中的比例已删除），当前策略是「解析失败重调一次 LLM + 兜底话术」保证不白屏。
 
-### 7.4 踩坑四：WebSocket 长连接频繁断开
+### 7.4 设计点：Nginx 反代下的 WebSocket 保活与断线续传
 
-- **现象（Bug）**：课堂跑 2-3 分钟后 WebSocket 自动断开，前端收到 `onclose` 但没有重连逻辑，学生中途掉线后错过后续授课。
-- **排查过程**：部署架构里 Nginx 反代的 `proxy_read_timeout` 默认 60s，课堂在老师讲授长段落时前端只接收不发，被判定为空闲连接切断；本地直连 uvicorn 开发时不会触发该问题，需在容器/Nginx 环境下复现。
-- **我的解法**：
-  1. 前端加心跳，每 30s 发一次 `{"type":"ping"}`，后端回 `pong` 保活；
-  2. `onclose` 时指数退避重连（1/2/4/8s，最多重试 5 次），重连时携带 `last_msg_id`，后端从消息缓冲（配置 `REDIS_URL` 用 Redis，否则进程内）补发断线期间的消息；
-  3. 后端改为「先入缓冲、再尝试发送」：连接刚断时 `send` 可能不报错（消息看似已发但客户端收不到），先缓冲可避免丢消息；重连按 `last_msg_id` 去重补发，补发中途再次断线则保留缓冲等下次重连继续。
-- **结果**：长连接稳定，断线后能续传，不再错过中途消息；实测断线期间产生的消息在重连后按 id 连续补发、不丢最后一条 `end` 事件。
+- **背景**：课堂消息持续推送，但浏览器 / 反代 / 容器网络都可能中断长连接；不处理会丢消息，简单重连又会重复或乱序。本机没有 Docker / Nginx 实机环境，该设计只做了配置与测试层面的验证（`frontend/nginx.conf` 已配置 `proxy_read_timeout 300s`），未在真实反代环境实测。
+- **做法**：
+  1. **心跳**：前端每 30s 发 `{"type":"ping"}`，后端回 `pong`，避免连接被反代按空闲超时回收；
+  2. **重连**：`onclose` 后指数退避重连（1/2/4/8s，最多 5 次）；服务端对不存在的会话 `close(4004)`，前端识别后停止重连并提示重新创建课堂；
+  3. **续传**：重连时携带 `lastMsgId`，后端只补发 id 更大的缓冲帧；`lastMsgId` 只在 `message_end / alert / end / error` 等完整帧上推进，`message_start / message_delta / profile` 不推进，因此半条流式消息会从 `message_start` 完整重发、不重影；
+  4. **一致性**：帧先入缓冲再发送，补发与实时推送共用 `session._send_lock`，保证客户端收到的 id 严格递增（详见 7.7 的 review 修复与回归用例）。
+- **验证方式**：`tests/test_smoke.py` 第 3–6 组覆盖「补发不丢尾消息 / 补发只发给当前连接 / 补发与实时推送串行化 / 发送异常不中止课堂」；前端 `npm run build` 通过。`frontend/nginx.conf` 的 300s 超时配置未在真实容器中验证，列入 10.1「Docker 实机验证与 CI」演进项。
 
 ### 7.5 踩坑五：LLM 限流导致课堂卡死
 
-- **现象（Bug）**：研讨环节学生 Agent 群（默认 4 人，可配置）同时调用 LLM，触发 `RateLimitError: Too many requests`，整个课堂卡住无法继续。
+- **问题现象（真实 API 联调中观察到）**：研讨环节学生 Agent 群（默认 4 人，可配置）同时调用 LLM，触发 `RateLimitError: Too many requests`，整个课堂卡住无法继续。
 - **排查过程**：单个 LLM 账号有 QPM 限制，并发请求堆叠直接撞限流，没有重试机制时整个 `asyncio.gather` 抛错退出。
 - **我的解法**：
   1. 给 LLM 调用包一层 `tenacity` 重试装饰器，遇到 `RateLimitError` / `APIConnectionError` / `TimeoutError` 按 2s/4s/8s 指数退避重试 3 次；
@@ -1220,8 +1244,8 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
 
 ### 7.7 踩坑七：Code Review 发现的补发乱序与串台
 
-- **背景**：P0 完成后做 Code Review，针对「多客户端 + 重连补发 + 实时推送」并发场景补充了回放测试，发现三个问题。
-- **现象 1（补发与实时推送并发乱序）**：重连补发进行中，新一轮课堂消息实时推送到同一连接，实测客户端收到 id 顺序为 `1,4,2,3`——新消息插到了补发消息中间。
+- **背景**：P0 完成后做 Code Review（本人主导，AI 辅助 reviewer 交叉检查），针对「多客户端 + 重连补发 + 实时推送」并发场景补充了回放测试，发现三个问题。
+- **现象 1（补发与实时推送并发乱序）**：重连补发进行中，新一轮课堂消息实时推送到同一连接，回归用例（慢 WS + 并发补发模拟）中复现客户端收到 id 顺序为 `1,4,2,3`——新消息插到了补发消息中间。
 - **解法 1**：给会话加一把 `asyncio.Lock`（`session._send_lock`），`send_or_buffer` 与 `replay_missed` 全程持锁；补发期间新帧排队等待，顺序恒为 `1,2,3,4`。
 - **现象 2（补发串台）**：`replay_missed` 最初直接用 `session.ws` 发送，而 `session.ws` 会被新连接覆盖；两个连接并发补发 / 新连接建立时，消息被发到了另一个连接，两端都可能缺消息。
 - **解法 2**：`replay_missed` 改为显式接收「当前连接 ws」参数，补发只写给本次连接；发送失败也只清空匹配的连接引用（`if session.ws is ws`），不会误清后建立的新连接。
@@ -1233,21 +1257,21 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
 
 ## 八、项目性能自测数据
 
-以下数据为本地单机实测结果（测试机：Intel i7-6700HQ / 11.8GB RAM / 无 GPU / Windows；Python 3.13（`.venv`）；Node 24），仅作为开发阶段自测参考，非生产级压测；未实测项均明确标注，不做估算填充。
+以下数据为本地单机实测结果（测试机：Intel i7-6700HQ / 11.8GB RAM / 无 GPU / Windows；Python 3.13（`.venv`）；Node 24），仅作为开发阶段自测参考，非生产级压测；未实测项均明确标注，不做估算填充。**真实 API 相关结果为本地单次冒烟、无留存日志、非统计结论**，复现命令见附录 B.9。
 
 | 指标 | 测试场景 | 实测数据 |
 |------|----------|----------|
 | 知识库规模 | `knowledge_base/` 示例教材 + FAISS 索引 | 1 份 txt（42 行 / 7141 字节）→ 10 chunks |
-| Mock 全流程耗时（无打字节奏） | 4 学生 / 25 条消息，`STREAM_INTERVAL_SECONDS=0` | 4.07s |
-| Mock 全流程耗时（打字节奏） | 同上，`STREAM_INTERVAL_SECONDS=0.02`、`STREAM_CHUNK_SIZE=12` | 10.19s |
-| 流式帧数与缓冲 | 单堂课（4 学生 / 25 条消息） | 199 帧/堂；消息缓冲约 30.8KB/堂 |
-| 真实 LLM 全流程（P0） | 阿里百炼 `qwen-plus`，4 学生、关闭 RAG | 25 次 LLM 调用，总耗时约 69s（P0 阶段实测） |
-| 真实 API + RAG 全链路（P1 冒烟） | 阿里百炼 `qwen-plus`，RAG 开启（`E:\ai_classroom_index` 本地索引 + `bge-large-zh`，跳过重排模型），`STREAM_INTERVAL_SECONDS=0`（关闭打字节奏，纯测链路），4 学生 | 约 162.5s / 25 次 LLM 调用 / 616 个 WS 帧；老师 7 轮 phase 序列正确、r2 结构化测验解析成功（4 选项、`answer_index=1`、知识点齐全）、4 名学生作答全部正确（accuracy=1.0）、2 个互补分组（第1组 概念辨析 同学1/同学3；第2组 例题应用 同学2/同学4）、学情档案完整；RAG 引用命中教材章节（第1章 1.2/1.5、第2章 2.1/2.3 等）；单次全链路冒烟实测，未做系统压测 |
+| Mock 全流程耗时（无打字节奏） | 4 学生 / 25 条消息，`STREAM_INTERVAL_SECONDS=0` | 4.06s |
+| Mock 全流程耗时（打字节奏） | 同上，`STREAM_INTERVAL_SECONDS=0.02`、`STREAM_CHUNK_SIZE=12` | 9.98s |
+| 流式帧数与缓冲 | 单堂课（4 学生 / 25 条消息） | 192 帧/堂（25 start + 140 delta + 25 end + profile + end）；消息缓冲 30,775 B（约 30.8KB）/堂 |
+| 真实 LLM 全流程（P0） | 阿里百炼 `qwen-plus`，4 学生、关闭 RAG | 25 次 LLM 调用，总耗时约 69s（P0 阶段单次实测，无留存日志） |
+| 真实 API + RAG 全链路（P1 冒烟） | 阿里百炼 `qwen-plus`，RAG 开启（`E:\ai_classroom_index` 本地索引 + `bge-large-zh`，跳过重排模型），`STREAM_INTERVAL_SECONDS=0`（关闭打字节奏，纯测链路），4 学生 | 约 162.5s / 25 次 LLM 调用 / 616 个 WS 帧；老师 7 轮 phase 序列正确、r2 结构化测验解析成功（4 选项、`answer_index=1`、知识点齐全）、4 名学生作答全部正确（accuracy=1.0）、2 个互补分组（第1组 概念辨析 同学1/同学3；第2组 例题应用 同学2/同学4）、学情档案完整；RAG 引用命中教材章节（第1章 1.2/1.5、第2章 2.1/2.3 等）；**本地单次冒烟、无留存日志、非统计结论**，复现命令见附录 B.9 |
 | RAG 模型加载 | `bge-large-zh`（约 1.2GB）CPU 首次加载 | 约 52s |
 | RAG 首次检索 | 含 BM25 / jieba 建索引 | 约 8.3s |
 | RAG 热检索 | 索引与模型已加载 | 203–241ms/次 |
 | 重排模型 | `bge-reranker-large`（约 2.1GB） | 已缓存时加载，未缓存自动跳过（加载耗时未单独实测） |
-| 前端构建 | `npm run build` | 约 11s，1602 modules；产物 JS 1047KB（gzip 344KB）/ CSS 368KB（gzip 50KB）；Vite 有既有的 chunk>500KB 警告 |
+| 前端构建 | `npm run build` | Vite 输出 built in ≈11.9s（另一次 10.8s），1602 modules；产物 JS 约 1.0MB（gzip 约 344KB）/ CSS 约 368KB（gzip 约 50KB）；Vite 有既有的 chunk>500KB 警告 |
 | 自动化测试 | `test_smoke.py` 8 组 + `test_store.py` 11 项 | 全部通过（Mock，无需 Key / 索引 / Redis） |
 
 **测试方法**：
@@ -1255,13 +1279,13 @@ P1 把「一条消息一个帧」改为「一条逻辑消息拆成多帧」，�
 - Mock / 真实 LLM 全流程耗时：用 `time.perf_counter()` 包住 `ClassroomSession.run()` 全程，取多次运行的代表值；Mock 模式通过 `llm_client.LLM_API_KEY=""` 强制走内置 Mock LLM；
 - 流式帧数与缓冲大小：课堂结束后遍历 `SessionStore.list_messages()` 统计帧数、累加 UTF-8 字节数；测耗时默认关闭打字节奏（`STREAM_INTERVAL_SECONDS=0`），再单独用默认 0.02s/12 字节奏测一次；
 - RAG 延迟：在 `HybridRetriever.retrieve` 外层用 `time.perf_counter()` 打点，区分「首次检索（含模型加载 / BM25 建索引）」与「热检索」；
-- P1 全链路实测：真实 `qwen-plus` + 本地 FAISS 索引（RAG 开启、跳过重排模型），设置 `STREAM_INTERVAL_SECONDS=0` 跑完整课堂，记录总耗时、LLM 调用次数、WS 帧数、老师 7 轮 phase、r2 测验解析与学生作答正确率、分组 / 学情档案及 RAG 引用章节；RAG embedding 为后台预热与课堂并发加载。单次样本，非统计口径；
+- P1 全链路实测：真实 `qwen-plus` + 本地 FAISS 索引（RAG 开启、跳过重排模型），设置 `STREAM_INTERVAL_SECONDS=0` 跑完整课堂，记录总耗时、LLM 调用次数、WS 帧数、老师 7 轮 phase、r2 测验解析与学生作答正确率、分组 / 学情档案及 RAG 引用章节；RAG embedding 为后台预热与课堂并发加载；**本地单次冒烟、无留存日志、非统计结论**，复现命令见附录 B.9；
 - 前端构建：`npm run build` 计时并读取 Vite 输出的 modules 数与产物体积；
 - 内存峰值：P1 版本未重新采样（`psutil` 相关脚本未纳入回归），本表不再给出内存峰值数字。
 
 **关于学生 Agent 并发耗时的说明**：
 
-当前默认 4 个学生 Agent，`asyncio.gather` 并发 + `Semaphore(5)` 限流；Mock 模式下单次 LLM 调用固定延迟 0.3s，因此 Mock 全流程耗时的差异主要来自流式分片节奏（4.07s → 10.19s）。真实 API 下单次 LLM 请求约 2–3s（P0 阶段观察，未做系统压测）；P1 真实 API + RAG 全链路单堂实测约 162.5s（25 次调用，含 RAG 检索与课堂串行调度），同样未做系统压测，不能简单用「162.5s ÷ 25」推算单请求耗时。学生数可通过 `STUDENT_PERSONALITIES` 调整，但并发规模受 LLM QPM 限制，扩大规模时需要同步调整 `Semaphore` 上限或改用多 Key / 本地模型。当前未实现按角色限制 `max_tokens`，也未实现 token 级流式（见 10.1）。
+当前默认 4 个学生 Agent，`asyncio.gather` 并发 + `Semaphore(5)` 限流；Mock 模式下单次 LLM 调用固定延迟 0.3s，因此 Mock 全流程耗时的差异主要来自流式分片节奏（4.06s → 9.98s）。真实 API 下单次 LLM 请求约 2–3s（P0 阶段观察，单次本地冒烟、无留存日志）；P1 真实 API + RAG 全链路单堂约 162.5s（25 次调用，含 RAG 检索与课堂串行调度），同样未做系统压测，不能简单用「162.5s ÷ 25」推算单请求耗时。学生数可通过 `STUDENT_PERSONALITIES` 调整，但并发规模受 LLM QPM 限制，扩大规模时需要同步调整 `Semaphore` 上限或改用多 Key / 本地模型。当前未实现按角色限制 `max_tokens`，也未实现 token 级流式（见 10.1）。
 
 ---
 
@@ -1476,6 +1500,128 @@ python tests/test_store.py     # 预期最后一行：ALL P1 STORE TESTS PASSED
 
 进入课堂界面后，输入授课主题（例如「高等数学 第一章 极限与连续」）并点击开始授课。系统会依次触发：老师讲解（r1）→ 随堂测验与学生作答（r2）→ 讲评与追问（r3）→ 性格互补分组研讨（r4）→ 助教批改（r5）→ 布置作业与学情总结（r6）→ 学情总结（r7），随后下发 `profile` 学情档案与 `end` 结束帧；也可通过 `GET /api/classroom/{session_id}/profile` 查询档案，可在前端实时观察各 Agent 的发言与流转。
 
+### B.9 性能数据复现命令
+
+> 以下命令均为本机（Intel i7-6700HQ / 11.8GB / Windows / Python 3.13 / Node 24）自测口径；Mock 数据可离线复现，真实 API 数据为单次冒烟、无留存日志、非统计结论。
+
+**1) 回归测试（Mock，无需 Key / 索引 / Redis）**
+
+```bash
+cd backend
+python tests/test_smoke.py     # 8 组，预期最后一行 ALL P0/P1 REGRESSION TESTS PASSED
+python tests/test_store.py     # 11 项，预期最后一行 ALL P1 STORE TESTS PASSED
+```
+
+**2) Mock 全流程耗时 / 帧数 / 缓冲**
+
+在 `backend/` 下新建 `tmp_bench_mock.py`：
+
+```python
+import asyncio, json, os, sys, time
+BACKEND = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BACKEND)
+os.environ["VECTOR_INDEX_PATH"] = os.path.join(BACKEND, "_no_index_for_bench")
+os.environ["REDIS_URL"] = ""
+import llm_client
+
+llm_client.LLM_API_KEY = ""  # 强制 Mock（必须在 import classroom 之前，避免 .env 中的真实 Key 生效）
+
+import classroom, config
+
+class FakeWS:
+    async def send_json(self, payload):
+        return None
+
+async def run(interval):
+    config.STREAM_INTERVAL_SECONDS = interval
+    classroom.STREAM_INTERVAL_SECONDS = interval
+    s = classroom.create_session("Mock 基准")
+    s.ws = FakeWS()  # 在线连接才会按 interval 打节奏
+    t0 = time.perf_counter()
+    await s.run()
+    dt = time.perf_counter() - t0
+    frames = await s.store.list_messages(s.session_id)
+    types = {}
+    for raw in frames:
+        ft = json.loads(raw)["type"]
+        types[ft] = types.get(ft, 0) + 1
+    total = sum(len(raw.encode("utf-8")) for raw in frames)
+    print(f"interval={interval}: {dt:.2f}s frames={len(frames)} types={types} buffer={total}B")
+
+asyncio.run(run(0.0))     # 预期约 4.06s
+asyncio.run(run(0.02))    # 预期约 9.98s
+```
+
+```bash
+cd backend
+python tmp_bench_mock.py
+# 预期：frames=192（25 start + 140 delta + 25 end + profile + end），buffer=30,775B
+```
+
+**3) RAG 加载 / 检索计时**（需本地索引与 `bge-large-zh`；模型未缓存时会先下载约 1.2GB）
+
+在 `backend/` 下新建 `tmp_bench_rag.py`：
+
+```python
+import time
+from rag.retriever import HybridRetriever
+
+r = HybridRetriever()
+t0 = time.perf_counter()
+r.retrieve("函数极限的 ε-δ 定义")
+print(f"首次检索（含模型加载 / BM25 建索引）: {time.perf_counter() - t0:.1f}s")
+for i in range(5):
+    t0 = time.perf_counter()
+    r.retrieve("极限的四则运算法则")
+    print(f"热检索 {i + 1}: {(time.perf_counter() - t0) * 1000:.0f}ms")
+```
+
+```bash
+cd backend
+python tmp_bench_rag.py
+# 参考口径（见 6.2.2）：首次加载约 52s、首次检索约 8.3s、热检索 203–241ms
+# 注意：本机若已缓存 bge-reranker-large，retriever 会自动加载重排模型，耗时口径会明显变大；
+#       复现「跳过重排」口径时，可临时把 .env 的 RERANKER_MODEL 设为未缓存名称（如 BAAI/not-cached）。
+```
+
+**4) 真实 API 全链路**（需 `.env` 中有效 `LLM_API_KEY`；会产生约 25 次 API 调用费用）
+
+先启动后端，再执行脚本；`websockets` 已在 requirements 中，`httpx` 通常随 `openai` 安装。在项目根新建 `tmp_bench_e2e.py`：
+
+```python
+import asyncio, json, time
+import httpx
+import websockets
+
+async def main():
+    async with httpx.AsyncClient() as c:
+        r = await c.post("http://127.0.0.1:8000/api/classroom/start",
+                         json={"topic": "高等数学 第一章 极限与连续"})
+        sid = r.json()["session_id"]
+    t0 = time.perf_counter()
+    frames = 0
+    async with websockets.connect(f"ws://127.0.0.1:8000/ws/{sid}?last_msg_id=0") as ws:
+        await ws.send(json.dumps({"type": "start"}))
+        while True:
+            data = json.loads(await asyncio.wait_for(ws.recv(), timeout=300))
+            frames += 1
+            if data.get("type") == "end":
+                break
+    print(f"耗时 {time.perf_counter() - t0:.1f}s，共 {frames} 帧")
+
+asyncio.run(main())
+```
+
+```bash
+# 终端1：启动后端（真实 API，非 Mock）
+cd backend
+uvicorn main:app --reload --port 8000
+# 终端2：跑全链路（项目根执行）
+python tmp_bench_e2e.py
+```
+
+> 口径说明：真实 API 为**本地单次冒烟、无留存日志、非统计结论**；文档中 69s（P0）/ 162.5s、616 帧（P1）即该方式下的单次结果，复测会因网络、QPM、模型版本与重排模型是否加载而波动。测试完成后可删除 `tmp_bench_*.py`。
+
 ---
 
 ## 附录 C：面试常见追问准备
@@ -1488,12 +1634,14 @@ python tests/test_store.py     # 预期最后一行：ALL P1 STORE TESTS PASSED
 | 如果 RAG 检索质量一直上不来，怎么排查？ | 先看召回指标（Hit Rate），再分析 bad case：分块是否合理、embedding 模型是否合适、BM25 权重是否失衡、重排是否生效；当前示例语料只有 1 份教材 / 10 chunks，首先要扩充语料，再做离线评测集。 |
 | 4 个学生 Agent 并发会不会把 LLM API 打爆？ | 已用 `Semaphore(5)` 控制并发上限，配合指数退避重试（2s/4s/8s × 3 次）。当前未按角色限制 `max_tokens`，学生数可通过 `STUDENT_PERSONALITIES` 扩展，但需同步评估 QPM；QPM 不够时可切多 API Key 轮询或换本地小模型。 |
 | WebSocket 断线重连后，消息会重复推送吗？ | 前端携带 `last_msg_id`，后端只补发 id 更大的帧；`lastMsgId` 只在 `message_end / alert / end / error` 上推进，`message_start / message_delta / profile` 不推进；前端按 id 聚合、同 id `start` 重置内容，因此既不重复也不缺字。 |
-| 告警会不会打断课堂、吞掉教学轮次？ | 不会。manager 处理完告警后通过 `resume_target` 回到本轮原定应去的节点（teacher / student / ta / END），老师轮次始终 7 轮；实测全部学生超时场景 alert=16、manager=5、teacher=7。 |
+| 告警会不会打断课堂、吞掉教学轮次？ | 不会。manager 处理完告警后通过 `resume_target` 回到本轮原定应去的节点（teacher / student / ta / END），老师轮次始终 7 轮；回归测试（`test_smoke.py` 第 7 组）可复现全部学生超时场景 alert=16、manager=5、teacher=7。 |
 | 没装 Redis 能跑吗？ | 能。`SessionStore` 未配置 `REDIS_URL` 时使用进程内存储（会话状态 / 消息缓冲 / 学情档案 / 记忆快照），带 TTL 与 `purge_expired`；配置了但连不上时自动降级并打 warning，服务不崩溃。代价是单进程、重启后数据丢失。 |
 | 流式输出是 token 级吗？ | 不是，当前是"消息级分片 + 前端打字机"：LLM 整条生成后由后端按 12 字/片拆成 `message_start / delta / end` 推送（0.02s 片间延迟），前端逐帧追加。真正的 token 级流式列入演进方向。 |
-| Code Review 发现了什么问题？ | 三个并发问题：①补发与实时推送无锁导致乱序（实测 `1,4,2,3`，加 `_send_lock` 后 `1,2,3,4`）；②补发用 `session.ws` 导致双连接消息串台（改为显式传当前连接）；③发送异常类型不可枚举（改为捕获所有异常 + 5s 超时兜底），详见 7.7。 |
+| Code Review 发现了什么问题？ | 三个并发问题：①补发与实时推送无锁导致乱序（回归用例复现 `1,4,2,3`，加 `_send_lock` 后 `1,2,3,4`）；②补发用 `session.ws` 导致双连接消息串台（改为显式传当前连接）；③发送异常类型不可枚举（改为捕获所有异常 + 5s 超时兜底），详见 7.7。review 由本人主导、AI 辅助 reviewer 交叉检查。 |
 | 这个项目能直接拿去给真实学生用吗？ | 目前是 Demo 验证阶段，离产品化还有距离（单客户端、无鉴权、学生为 LLM 模拟、刷新丢课堂视图）。核心框架已搭好，后续补齐 UI、权限、多班级、真实学生接入后可上线试用。 |
 | 多 Agent 并发写入时具体是什么 Bug？怎么发现的？ | 学生群节点并行调用 LLM 后，若把每个学生的回复各自直接 return，LangGraph 对 `messages` 默认是覆盖式写入，会导致消息互相覆盖丢失。改用 `Annotated[list, operator.add]` 追加合并，并让学生节点只产出新增消息（`new_messages`）、由 `arbiter` 节点用 `asyncio.Lock` 串行化排序后统一写入（详见 7.1）。 |
+| 这个项目是 AI 写的吗？你的个人贡献边界是什么？ | 2026-08 有 GLM 原型，2026-10-19 用 AI 编码助手重构/补齐 P0/P1；本人负责方案设计与技术选型、核心实现与联调、测试与性能自测、文档与部署配置验收。AI 用于编码加速与 Code Review 辅助，代码由本人逐模块阅读、修改并跑回归验证，可现场讲解与修改。详见 1.5。 |
+| 为什么 Git 只有 5 个 commit，且都集中在 10-19？ | 仓库是 2026-10-19 重构时才初始化的，5 个 commit 依次是「初始化+P0 修复 → GLM 表述清理 → Review 修复 → P1 功能 → 文档与实测数据对齐」；2026-08 的原型开发不在仓库历史中。项目主体是当晚集中完成的重构版本，不冒充长期迭代。 |
 
 ---
 
