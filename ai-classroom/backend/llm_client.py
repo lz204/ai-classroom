@@ -66,6 +66,14 @@ _RE_MANAGER = re.compile(r"【课堂管理员】")
 _RE_STUDENT_ID = re.compile(r"【学生ID】\s*([A-Za-z0-9_\-]+)")
 _RE_STUDENT_NAME = re.compile(r"【学生姓名】\s*([^\n]+)")
 _RE_TOPIC = re.compile(r"【主题】\s*([^\n]+)")
+# P1 教学闭环新增标记：随堂测验（老师）与答题模式（学生）
+_RE_QUIZ = re.compile(r"【随堂测验】")
+_RE_ANSWER_MODE = re.compile(r"【答题模式】")
+_RE_QUIZ_ID = re.compile(r"【题目ID】\s*([^\n]+)")
+# 选项行：形如 "A. 选项内容" / "B、选项内容"（学生答题 Prompt 中由 workflow/agent 拼出）
+_RE_OPTION_LINE = re.compile(r"^[ \t]*([A-D])[.、)]\s*(.+?)[ \t]*$", re.MULTILINE)
+# 选项下标 -> 字母
+_OPTION_LETTERS = ("A", "B", "C", "D")
 
 
 class MockLLM(LLMClient):
@@ -87,7 +95,8 @@ class MockLLM(LLMClient):
             self._topic = topic_match.group(1).strip()
 
         if _RE_TEACHER.search(prompt):
-            return self._teacher_response()
+            # 老师 Prompt 中只有「随堂测验」环节才会带【随堂测验】约束，此时需一并输出 quiz
+            return self._teacher_response(with_quiz=bool(_RE_QUIZ.search(prompt)))
         if _RE_STUDENT.search(prompt):
             return self._student_response(prompt)
         if _RE_TA.search(prompt):
@@ -97,30 +106,66 @@ class MockLLM(LLMClient):
         # 未识别角色：输出通用兜底结构（不影响上层校验）
         return json.dumps({"speaker": "unknown", "content": "Mock LLM 未识别角色标记"}, ensure_ascii=False)
 
-    def _teacher_response(self) -> str:
-        """主讲老师：授课/答疑内容，带引用来源"""
-        return json.dumps(
-            {
-                "speaker": "teacher",
-                "content": f"同学们好，今天我们学习《{self._topic}》。"
-                           "首先明确本节核心概念：函数在某点的极限描述了当自变量趋近该点时函数值的稳定趋势。"
-                           "这是后续导数与积分的基础，请大家结合教材第 2 章例题理解。",
-                "citation": ["教材第2章 极限与连续"],
-            },
-            ensure_ascii=False,
-        )
+    def _teacher_response(self, with_quiz: bool = False) -> str:
+        """主讲老师：授课/答疑内容，带引用来源；r2 随堂测验环节额外返回 quiz 结构。"""
+        payload = {
+            "speaker": "teacher",
+            "content": f"同学们好，今天我们学习《{self._topic}》。"
+                       "首先明确本节核心概念：函数在某点的极限描述了当自变量趋近该点时函数值的稳定趋势。"
+                       "这是后续导数与积分的基础，请大家结合教材第 2 章例题理解。",
+            "citation": ["教材第2章 极限与连续"],
+        }
+        if with_quiz:
+            payload["content"] += "下面做一道随堂测验，检验大家对极限定义的理解。"
+            payload["quiz"] = {
+                "quiz_id": "quiz_1",
+                "question": f"关于《{self._topic}》中函数极限的描述，下列说法正确的是？",
+                "options": [
+                    "函数在某点的极限与函数在该点是否有定义无关",
+                    "函数在某点的极限一定等于函数在该点的函数值",
+                    "函数在某点的极限不存在时，左右极限也一定都不存在",
+                    "函数在某点的极限存在，则该函数在该点必定连续",
+                ],
+                "answer_index": 1,
+                "knowledge_point": "极限的定义",
+            }
+        return json.dumps(payload, ensure_ascii=False)
 
     def _student_response(self, prompt: str) -> str:
-        """学生：提问/回答，speaker 字段为学生 id（与发言队列一致）"""
+        """学生：普通提问/研讨，或【答题模式】下返回随堂测验作答（speaker 为学生 id）。"""
         sid = _RE_STUDENT_ID.search(prompt)
         name = _RE_STUDENT_NAME.search(prompt)
         speaker = sid.group(1) if sid else "student_unknown"
         student_name = name.group(1).strip() if name else speaker
+        if _RE_ANSWER_MODE.search(prompt):
+            return self._student_answer_response(prompt, speaker, student_name)
         return json.dumps(
             {
                 "speaker": speaker,
                 "content": f"我是{student_name}。想请教老师：如果函数在某点无定义，但左右极限存在且相等，"
                            "是否可以认为该点极限存在？希望老师结合例子说明。",
+            },
+            ensure_ascii=False,
+        )
+
+    def _student_answer_response(self, prompt: str, speaker: str, student_name: str) -> str:
+        """学生答题模式：固定选择 B（choice_index=1），choice_text 取对应选项原文。"""
+        quiz_id = _RE_QUIZ_ID.search(prompt)
+        options = [text.strip() for _, text in _RE_OPTION_LINE.findall(prompt)]
+        # 答案解析优先级：第2个选项（B）；选项不足时退化为第一个选项
+        choice_index = 1 if len(options) > 1 else 0
+        choice_text = options[choice_index] if choice_index < len(options) else ""
+        answer = {
+            "student_id": speaker,
+            "quiz_id": quiz_id.group(1).strip() if quiz_id else "",
+            "choice_index": choice_index,
+            "choice_text": choice_text,
+        }
+        return json.dumps(
+            {
+                "speaker": speaker,
+                "content": f"我是{student_name}，我选择 {_OPTION_LETTERS[choice_index]}：{choice_text}",
+                "answer": answer,
             },
             ensure_ascii=False,
         )

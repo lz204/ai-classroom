@@ -51,3 +51,18 @@ STUDENT_PERSONALITIES = os.getenv(
     "STUDENT_PERSONALITIES", "introvert,active,expert,follower"
 ).split(",")
 STUDENT_PERSONALITIES = [p.strip() for p in STUDENT_PERSONALITIES if p.strip()]
+# 学生分组数（性格互补分组研讨：expert+introvert / active+follower 配对）
+STUDENT_GROUP_COUNT = int(os.getenv("STUDENT_GROUP_COUNT", "2"))
+
+# ============ 课堂超时与流式输出 ============
+# 单个教学环节超时（秒）：超时后由管理员 Agent 收束；测试可调小
+STAGE_TIMEOUT_SECONDS = float(os.getenv("STAGE_TIMEOUT_SECONDS", "300"))
+# 整堂课超时（秒）
+CLASS_TIMEOUT_SECONDS = float(os.getenv("CLASS_TIMEOUT_SECONDS", "1800"))
+# 消息流式分片：每片字符数与片间延迟（秒），用于前端打字机效果
+STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "12"))
+STREAM_INTERVAL_SECONDS = float(os.getenv("STREAM_INTERVAL_SECONDS", "0.02"))
+
+# ============ 持久化 ============
+# 会话元数据 / 消息缓冲 / 学情档案在 Redis（或进程内降级）中的 TTL（秒）
+CLASSROOM_TTL = int(os.getenv("CLASSROOM_TTL", "3600"))

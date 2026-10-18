@@ -3,7 +3,9 @@
 - 滑窗记忆：保留最近 N 轮原始对话；
 - 摘要压缩：超过窗口阈值时调用 LLM 压缩前半段历史，避免上下文无限膨胀；
 - 实体记忆：抽取"知识点/章节号"等实体建立关联，提问时可召回前文同一知识点片段。
-当前为进程内内存实现，容器重启后丢失（生产演进：序列化到 Redis，见项目文档 6.3.3）。
+
+进程内内存实现；提供 to_dict()/from_dict() 序列化，可经 SessionStore 持久化到 Redis，
+容器重启后由会话层恢复（见 store.py）。
 """
 import re
 
@@ -38,6 +40,22 @@ class _SimpleEntityStore:
                     seen.add(snippet)
                     result.append(snippet)
         return result
+
+    def to_dict(self) -> dict:
+        """序列化为可 JSON 持久化的字典：{"entities": {entity: [snippet, ...]}}"""
+        return {"entities": {key: list(snippets) for key, snippets in self._entities.items()}}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "_SimpleEntityStore":
+        """从 to_dict() 快照恢复；非法/缺失字段按空实体存储处理（不抛异常）。"""
+        entity_store = cls()
+        entities = (data or {}).get("entities") or {}
+        if isinstance(entities, dict):
+            for key, snippets in entities.items():
+                if not isinstance(snippets, list):
+                    continue
+                entity_store._entities[str(key)] = [str(snippet) for snippet in snippets]
+        return entity_store
 
 
 class LayeredMemory:
@@ -82,6 +100,46 @@ class LayeredMemory:
             "summary": self._summary_text,
             "entities": entities,
         }
+
+    def to_dict(self) -> dict:
+        """序列化三层记忆为可 JSON 持久化的快照（供 SessionStore 保存）。
+
+        返回 {"buffer": 滑窗对话列表, "summary": 摘要文本, "entities": 实体->片段列表}；
+        buffer/entities 均返回副本，调用方修改不会影响记忆内部状态。
+        """
+        return {
+            "buffer": [dict(item) for item in self._buffer],
+            "summary": self._summary_text,
+            "entities": self._entity_store.to_dict()["entities"],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, llm) -> "LayeredMemory":
+        """从 to_dict() 快照恢复记忆；window_size/summary_threshold 使用默认值。
+
+        非法/缺失字段按空值处理（不抛异常），保证从 Redis 恢复失败时课堂仍可继续。
+        """
+        memory = cls(llm)
+        data = data if isinstance(data, dict) else {}
+        buffer = data.get("buffer") or []
+        if isinstance(buffer, list):
+            for item in buffer:
+                if not isinstance(item, dict):
+                    continue
+                memory._buffer.append(
+                    {
+                        "user": str(item.get("user", "") or ""),
+                        "ai": str(item.get("ai", "") or ""),
+                    }
+                )
+        summary = data.get("summary")
+        memory._summary_text = "" if summary is None else str(summary)
+        entities = data.get("entities")
+        if isinstance(entities, dict):
+            memory._entity_store = _SimpleEntityStore.from_dict({"entities": entities})
+        # 恢复后若滑窗已超阈值，下次 compress_if_needed 仍会压缩（与 save_context 行为一致）
+        memory._needs_compress = len(memory._buffer) > memory._summary_threshold
+        return memory
 
     async def compress_if_needed(self):
         """若滑窗超阈值，调用 LLM 压缩前半段历史，并替换原始对话。"""

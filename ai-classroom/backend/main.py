@@ -49,7 +49,7 @@ async def replay_missed(session: classroom.ClassroomSession, ws: WebSocket, last
       补发中途连接再次断开时直接返回，消息仍在缓冲中，等下次重连按新的 last_msg_id 继续补发。
     """
     async with session._send_lock:
-        buffered = await session.buffer.peek_all(session.buffer_key)
+        buffered = await session.store.list_messages(session.session_id)
         try:
             for item in buffered:
                 payload = json.loads(item)

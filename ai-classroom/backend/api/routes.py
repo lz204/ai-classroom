@@ -30,10 +30,14 @@ async def start_classroom(req: StartRequest):
 
 @router.get("/classroom/{session_id}")
 async def classroom_status(session_id: str):
-    """查询课堂会话状态"""
+    """查询课堂会话状态（本进程没有会话时从持久化存储读取状态快照）"""
     session = classroom.sessions.get(session_id)
     if session is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
+        meta = await classroom.load_session_meta(session_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        meta.setdefault("session_id", session_id)
+        return meta
     return {
         "session_id": session.session_id,
         "topic": session.topic,
@@ -42,4 +46,17 @@ async def classroom_status(session_id: str):
         "round": session.state.get("round"),
         "phase": session.state.get("phase"),
         "message_count": session.message_count,
+        "profile_ready": session.profile_data is not None,
     }
+
+
+@router.get("/classroom/{session_id}/profile")
+async def classroom_profile(session_id: str):
+    """查询课堂学情档案（课堂结束后生成；进程内会话或持久化存储中查询）"""
+    session = classroom.sessions.get(session_id)
+    if session is not None and session.profile_data is not None:
+        return session.profile_data
+    profile = await classroom.load_profile(session_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="学情档案尚未生成或会话不存在")
+    return profile
