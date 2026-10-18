@@ -1,22 +1,21 @@
 # AI Classroom 多智能体互动教学课堂
 
-基于 **FastAPI + LangGraph** 的多智能体互动教学课堂 Demo：AI 主讲老师、助教、4 名性格不同的学生 Agent 与课堂管理员在同一课堂状态机中协同，完成「授课 → 提问 → 随堂测验（出题 / 作答 / 讲评 / 批改）→ 小组研讨 → 作业布置 → 学情档案」全流程；授课内容由本地教材知识库 RAG 检索生成，尽量还原真实课堂的互动与秩序感。P1 版本补齐了随堂测验闭环、性格互补分组研讨、课堂超时管控、学情档案、消息级流式分帧（前端打字机）与可选的 Redis 持久化。
+基于 **FastAPI + LangGraph** 的多智能体互动教学课堂 Demo：AI 主讲老师、助教、4 名性格不同的学生 Agent 与课堂管理员在同一课堂状态机中协同，完成「授课 → 提问 → 随堂测验（出题 / 作答 / 讲评 / 批改）→ 小组研讨 → 作业布置 → 学情档案」全流程；授课内容由本地教材知识库 RAG 检索生成，尽量还原真实课堂的互动与秩序感。P1 版本补齐随堂测验闭环、性格互补分组研讨、课堂超时管控、学情档案、消息级流式分帧（前端打字机）与可选的 Redis 持久化；**P2 版本新增 Tool-Use Agent（Function Calling + ReAct）、手写最小 MCP Server/Client、前端「Agent 工具演示」面板、RAG/Agent 离线评测体系，以及 pytest + 覆盖率 + ruff + GitHub Actions CI。**
 
 > 完整的架构图、关键实现与踩坑复盘见设计文档：[《AI Classroom 多智能体互动教学课堂》项目文档](../AI_Classroom_多智能体互动教学课堂_项目文档.md)。
 
 ## 架构要点
 
 ```
-Vue3 + Vite ──REST / WebSocket──► FastAPI 后端 ──► LangGraph StateGraph
-                                                      ├─ teacher  主讲授课 / 出题 / 答疑
-                                                      ├─ student  学生群（节点内并发提问 / 答题 / 分组研讨）
-                                                      ├─ arbiter  发言仲裁与排序
-                                                      ├─ ta       随堂测验批改
-                                                      └─ manager  秩序管控 / 学情总结
-                                                           │
+Vue3 + Vite ──REST / WebSocket──► FastAPI 后端 ──► LangGraph 课堂状态机
+                                                      ├─ teacher / student / arbiter / ta / manager（7 轮固定编排）
+                                                      └─► Tool-Use Agent（Function Calling + ReAct，独立演示模块）
+                                                             ├─ 本地工具：search_knowledge_base / calculate / text_stats
+                                                             └─ MCP Server 子进程：mcp__calculate / mcp__get_current_time / mcp__text_stats
                                           RAG：FAISS 向量 + BM25 关键词（+ 可选重排）
                                           记忆：滑窗 + LLM 摘要 + 实体关联（三层）
                                           存储：SessionStore（Redis 可选 / 进程内降级 + TTL）
+                                          评测：eval/（RAG HitRate/MRR + Agent Mock 评测）
 ```
 
 - **后端**：FastAPI 提供 REST 接口（会话创建 / 状态查询 / 学情档案查询）与 WebSocket 实时推送；课堂会话、LangGraph 状态机、消息缓冲与学情档案由 `classroom.py` / `store.py` 统一管理。
@@ -31,52 +30,67 @@ Vue3 + Vite ──REST / WebSocket──► FastAPI 后端 ──► LangGraph S
 - **Redis 持久化（可选）**：`backend/store.py::SessionStore`，配置 `REDIS_URL` 时持久化会话状态 / 消息缓冲 / 学情档案 / 记忆快照，未配置或连接失败自动降级为进程内存储（打印 warning），TTL 默认 3600s（`CLASSROOM_TTL`，追加消息会续期）。
 - **WebSocket 断线续传**：前端 30s 心跳（`ping` / `pong`）；每条帧先入缓冲、再尝试推送，断线重连时携带 `last_msg_id`，后端只补发未收到的帧。`lastMsgId` 只在 `message_end` / `alert` / `end` / `error` / 旧 `message` 帧上推进，半条流式消息会在重连后从 `message_start` 重发，前端按 id 重置内容、不重影。补发与实时推送共用会话级 `asyncio.Lock` 串行化；「开始授课」指令幂等；会话不存在时服务端先 accept 再 close(4004)，前端停止自动重连（自动重连上限 5 次）。
 - **Mock LLM**：未配置 `LLM_API_KEY` 时自动降级为内置 Mock LLM，无 Key 也能跑通完整课堂流程（Mock 学生固定选 B 作答），便于本地演示与测试。
-- **代码规模（按非空行统计）**：后端 Python 共 3258 行（其中 tests 718 行：`test_smoke.py` 290 + `test_store.py` 428），核心约 2540 行；前端 `src` 共 1538 行。
+- **Tool-Use Agent（独立演示模块）**：`backend/tool_agent.py`，Function Calling + ReAct 循环；本地 3 工具 + MCP 动态注册 `mcp__*` 工具；护栏：`max_steps` / 整体超时 / 单工具超时 / 同一 `(tool,args)` 连续 3 次停止 / 参数按 `inputSchema` 白名单过滤 / 异常与超时降级（`degraded=true`）。课堂主流程是固定工作流编排，Agent 面板不接入自动流程。
+- **最小 MCP 实现**：`backend/mcp_server.py` / `mcp_client.py`，手写 stdio JSON-RPC 2.0（initialize / tools/list / tools/call / ping），安全 ast 求值；子进程懒连接、失败自动降级本地工具。**Windows 下 `uvicorn --reload` 会切 SelectorEventLoop 导致 MCP 子进程不可用（自动降级、不崩），演示请用 `make demo-backend`。**
+- **评测 / 工程化**：`backend/eval/` 离线评测（RAG HitRate@4 / MRR@4 / 风险无证据率；Agent/Tool 20 任务 Mock 评测），pytest 28 项 / 覆盖率 74% / ruff / GitHub Actions CI（无 secrets 依赖）。
+- **代码规模（按非空行统计）**：后端 Python 合计 6304 行（核心 3866 + tests 1153 + eval 1285）；前端 `src` 共 2064 行。
 
 ## 开发方式与个人贡献
 
-- 项目 2026-08 有一个基于智谱 GLM 的原型版本；2026-10-19 使用 AI 编码助手重构为阿里百炼 DashScope/Qwen，并补齐 P0/P1 能力（断线续传、随堂测验、分组研讨、流式分帧、学情档案、Redis 持久化）。
+- 项目 2026-08 有一个基于智谱 GLM 的原型版本；2026-10-19 使用 AI 编码助手重构为阿里百炼 DashScope/Qwen，并补齐 P0/P1/P2 能力（断线续传、随堂测验、分组研讨、流式分帧、学情档案、Redis 持久化；P2：ToolAgent / MCP / 评测 / CI）。
 - 本人负责方案设计与技术选型、核心实现与联调、测试与性能自测、文档与部署配置验收；AI 用于编码加速与 Code Review 辅助，产出代码由本人逐模块阅读、修改并跑回归验证，可逐行讲解 / 现场修改复跑。
-- 前端基于 Vue3 + Vite + Element Plus。**Git 历史只覆盖 2026-10-19 的重构（5 个 commit）**，2026-08 的原型开发不在仓库历史中；Docker 配置已编写，但本机无 Docker，未实机部署验证。
+- 前端基于 Vue3 + Vite + Element Plus。**Git 历史只覆盖 2026-10-19 的重构（当前 10 个 commit，01:03 起）**，2026-08 的原型开发不在仓库历史中；Docker 配置已编写，但本机无 Docker，未实机部署验证。
 
 ## 目录结构
 
 ```
-ai-classroom/
-├── backend/                    # FastAPI 后端
-│   ├── main.py                 # 入口：REST 路由 + WebSocket 端点（心跳 / 断线续传 / 4004）
-│   ├── classroom.py            # 课堂会话、流式分帧推送、断线补发、profile 下发
-│   ├── config.py               # 配置加载（从项目根 .env 读取）
-│   ├── llm_client.py           # LLM 客户端（DashScope OpenAI 兼容 / 内置 Mock）
-│   ├── analytics.py            # 学情档案 LearningProfile（规则统计）
-│   ├── store.py                # SessionStore：Redis 持久化 / 进程内降级 + TTL
-│   ├── agents/                 # teacher / student / ta / manager 各角色 Agent
-│   ├── graph/                  # 状态机、分组、发言队列与仲裁器
-│   │   ├── workflow.py         # 7 轮闭环、round 路由、resume_target、测验 / 分组
-│   │   ├── grouping.py         # 性格互补分组 build_groups
-│   │   └── speaker_queue.py    # 发言队列与 arbiter 仲裁器
-│   ├── rag/                    # ingest.py 建索引、retriever.py 混合检索
-│   ├── memory/                 # 三层对话记忆（滑窗 / 摘要 / 实体）
-│   ├── api/routes.py           # REST 路由（含 /profile）
-│   ├── tests/
-│   │   ├── test_smoke.py       # P0/P1 冒烟回归（8 组，Mock LLM）
-│   │   └── test_store.py       # 存储层单测（11 项）
-│   ├── requirements.txt        # 后端依赖清单
-│   └── Dockerfile
-├── frontend/                   # Vue3 + Vite + Element Plus 前端
-│   ├── src/
-│   │   ├── views/Classroom.vue             # 课堂主界面
-│   │   ├── components/                     # MessageBubble / QuizPanel / ProfileCard
-│   │   ├── composables/useMessageStream.js # 流式帧按 id 聚合
-│   │   ├── utils/format.js                 # 阶段 / 性格 / 时长 / 选项格式化
-│   │   └── websocket/index.js              # WS 封装（心跳 / 重连 / last_msg_id）
-│   ├── Dockerfile
-│   └── nginx.conf              # Nginx 静态资源 + API/WS 反向代理配置
-├── knowledge_base/             # 教材原始资料（示例教材：高等数学_极限与连续.txt）
-├── docker-compose.yml          # backend + frontend + redis 一键部署（本机未验证）
-├── Makefile                    # 常用命令
-├── .env.example                # 环境变量模板（复制为 .env 后填写）
-└── README.md
+仓库根/
+├── README.md                   # 落地页（短版：亮点 / 快速开始 / 诚实边界）
+├── AI_Classroom_..._项目文档.md # 详细技术文档（架构 / 实现 / 评测口径 / 面试问答）
+├── .github/workflows/ci.yml    # GitHub Actions CI（backend + frontend）
+└── ai-classroom/               # 项目主体
+    ├── backend/                    # FastAPI 后端
+    │   ├── main.py                 # 入口：REST 路由 + WebSocket 端点（心跳 / 断线续传 / 4004）
+    │   ├── classroom.py            # 课堂会话、流式分帧推送、断线补发、profile 下发
+    │   ├── config.py               # 配置加载（从项目根 .env 读取）
+    │   ├── llm_client.py           # LLM 客户端（DashScope OpenAI 兼容 / Mock；含 chat_with_tools）
+    │   ├── tool_agent.py           # Tool-Use Agent：Function Calling + ReAct + MCP 工具注册
+    │   ├── mcp_server.py           # 手写最小 MCP Server（stdio JSON-RPC 2.0）
+    │   ├── mcp_client.py           # MCP 子进程客户端（连接失败自动降级）
+    │   ├── analytics.py            # 学情档案 LearningProfile（规则统计）
+    │   ├── store.py                # SessionStore：Redis 持久化 / 进程内降级 + TTL
+    │   ├── agents/                 # teacher / student / ta / manager 各角色 Agent
+    │   ├── graph/                  # 状态机、分组、发言队列与仲裁器
+    │   │   ├── workflow.py         # 7 轮闭环、round 路由、resume_target、测验 / 分组
+    │   │   ├── grouping.py         # 性格互补分组 build_groups
+    │   │   └── speaker_queue.py    # 发言队列与 arbiter 仲裁器
+    │   ├── rag/                    # ingest.py 建索引、retriever.py 混合检索
+    │   ├── memory/                 # 三层对话记忆（滑窗 / 摘要 / 实体）
+    │   ├── eval/                   # 离线评测：rag_eval / agent_eval / run_all + reports
+    │   ├── api/routes.py           # REST 路由（/profile、/api/agent/tools、/api/agent/ask）
+    │   ├── tests/
+    │   │   ├── conftest.py         # pytest 全局隔离（Mock / 无 Redis / 无索引）
+    │   │   ├── test_smoke.py       # P0/P1 冒烟回归（8 组，Mock LLM）
+    │   │   ├── test_store.py       # 存储层单测（11 项）
+    │   │   └── test_tool_agent.py  # ToolAgent / MCP 测试（9 项）
+    │   ├── requirements.txt        # 运行时依赖
+    │   ├── requirements-dev.txt    # pytest / pytest-asyncio / pytest-cov / ruff
+    │   ├── pyproject.toml          # pytest / ruff / coverage 配置
+    │   └── Dockerfile
+    ├── frontend/                   # Vue3 + Vite + Element Plus 前端
+    │   ├── src/
+    │   │   ├── views/Classroom.vue             # 课堂主界面（含 Agent 工具演示面板）
+    │   │   ├── components/                     # MessageBubble / QuizPanel / ProfileCard / ToolAgentPanel / ToolAgentResult
+    │   │   ├── composables/useMessageStream.js # 流式帧按 id 聚合
+    │   │   ├── utils/format.js                 # 阶段 / 性格 / 时长 / 选项格式化
+    │   │   └── websocket/index.js              # WS 封装（心跳 / 重连 / last_msg_id）
+    │   ├── Dockerfile
+    │   └── nginx.conf              # Nginx 静态资源 + API/WS 反向代理配置
+    ├── knowledge_base/             # 教材原始资料（示例教材：高等数学_极限与连续.txt）
+    ├── docker-compose.yml          # backend + frontend + redis 一键部署（本机未验证）
+    ├── Makefile                    # 常用命令（含 demo-backend 无 --reload 演示模式）
+    ├── .env.example                # 环境变量模板（复制为 .env 后填写，含 TOOL_AGENT*/MCP*）
+    └── README.md
 ```
 
 ## 环境要求
@@ -89,6 +103,7 @@ ai-classroom/
 | 网络 / 模型 | 首次需下载嵌入模型 | `bge-large-zh` 约 1.2GB（CPU 可跑，无需 GPU；热检索实测 203–241ms/次）；可选重排模型 `bge-reranker-large` 约 2.1GB，未缓存时自动跳过                                         |
 | 索引路径    | 纯英文路径     | faiss 的 C 层读写不支持中文目录，而本项目路径含「ai实验」，故 `VECTOR_INDEX_PATH` 必须指向纯英文目录（如 `E:\ai_classroom_index`）                            |
 | 测试机     | i7-6700HQ / 11.8GB RAM / 无 GPU / Windows | 本项目 README 与设计文档中的实测数据均来自该环境（Python 3.13 + `.venv`、Node 24）                                                            |
+| 测试工具链 | pytest 9.1 / coverage 7.16 / ruff 0.17 | 见 `backend/requirements-dev.txt`；CI 使用 Python 3.11 + Node 20（GitHub Actions，不依赖 secrets） |
 
 ## 快速开始（本地开发）
 
@@ -101,6 +116,9 @@ ai-classroom/
 ```bash
 cd backend
 pip install -r requirements.txt
+
+# 开发/测试依赖（pytest / pytest-asyncio / pytest-cov / ruff；仅本地与 CI 需要）
+pip install -r requirements-dev.txt
 ```
 
 ### 2. 配置环境变量
@@ -123,6 +141,8 @@ copy .env.example .env        # Linux / macOS：cp .env.example .env
 - `STAGE_TIMEOUT_SECONDS` / `CLASS_TIMEOUT_SECONDS`：单教学环节 / 整堂课超时阈值（秒，默认 300 / 1800）。
 - `STREAM_CHUNK_SIZE` / `STREAM_INTERVAL_SECONDS`：流式分片大小（默认 12 字）与片间延迟（默认 0.02s，设为 0 可关闭打字节奏）。
 - `BACKEND_PORT`：后端监听端口（默认 8000）。
+- `TOOL_AGENT_MAX_STEPS` / `TOOL_CALL_TIMEOUT` / `TOOL_AGENT_TIMEOUT`：Tool-Use Agent 护栏（默认 6 步 / 10s / 60s）。
+- `ENABLE_MCP` / `MCP_SERVER_CMD` / `MCP_TIMEOUT`：MCP 开关、Server 启动命令（留空用 `python -m mcp_server`）、单请求超时（默认 10s）。
 - 真实的 Key 只放在 `.env`（已被 `.gitignore` 忽略），不要写入 `.env.example` 或提交到仓库。
 
 ### 3. 构建知识库索引
@@ -144,11 +164,18 @@ python rag/ingest.py --path ../knowledge_base
 
 ```bash
 cd backend
-uvicorn main:app --reload --port 8000
+# 演示 / 联调推荐：无 --reload（Windows 下 MCP 子进程可正常工作）
+python -m uvicorn main:app --port 8000
+# 或在 ai-classroom/ 根目录：make demo-backend
+
+# 开发热更新：--reload（Windows 下 MCP 自动降级为本地工具，不崩）
+# uvicorn main:app --reload --port 8000
 ```
 
 - 健康检查：<http://localhost:8000/api/health>
 - 接口文档（Swagger）：<http://localhost:8000/docs>
+
+> **Windows 重要限制**：`uvicorn --reload` 会切换到 `SelectorEventLoop`，该循环不支持 `asyncio` 子进程 → MCP Server 无法启动，Agent 自动降级为本地工具（`mcp_connected=false`，请求不失败）。需要演示 MCP 时请用 `make demo-backend`。
 
 ### 5. 启动前端（另开一个终端）
 
@@ -166,6 +193,7 @@ npm run dev
 2. 进入课堂后前端自动连接 WebSocket 并发送 `start`，实时展示老师 / 学生 / 助教 / 管理员发言、随堂测验面板与秩序告警。
 3. 课堂按固定 7 轮推进：老师讲解 → 随堂测验（学生作答、面板实时更新）→ 讲评与追问 → 分组研讨 → 助教批改 → 布置作业 → 学情总结，结束后先收到学情档案（`profile`）再收到结束帧（`end`），页面下方展示学情档案卡片。
 4. 网络断开后前端会自动重连（指数退避 1/2/4/8s，最多 5 次）并按 `last_msg_id` 补发消息；会话不存在（服务端 close 4004）时停止重连并提示重新发起授课。当前版本会话 id 未持久化，刷新页面会丢失课堂视图，需重新发起授课。
+5. 页面底部「Agent 工具演示」：点「查看可用工具」可确认本地 / `mcp__*` 工具与 MCP 连接状态；试 3 个预设（计算 12*3+5 / 极限的定义是什么 / 提示注入测试）并查看 trace 时间线。该面板按需点击，不接入课堂自动流程。
 
 ### Makefile 常用命令（项目根目录执行）
 
@@ -173,25 +201,45 @@ npm run dev
 | ----------------------- | ------------------------------------------------------------------------------------ |
 | `make install`          | 安装后端依赖（`pip install -r backend/requirements.txt`）与前端依赖（`cd frontend && npm install`） |
 | `make ingest`           | 构建知识库索引（`cd backend && python rag/ingest.py --path ../knowledge_base`）               |
-| `make dev-backend`      | 启动后端（`cd backend && uvicorn main:app --reload --port 8000`）                          |
+| `make demo-backend`     | 演示模式启动后端（`cd backend && python -m uvicorn main:app --port 8000`，无 --reload，Windows 下 MCP 可用） |
+| `make dev-backend`      | 开发模式启动后端（`cd backend && uvicorn main:app --reload --port 8000`，--reload 下 MCP 自动降级） |
 | `make dev-frontend`     | 启动前端（`cd frontend && npm run dev`）                                                   |
 | `make up` / `make down` | Docker Compose 启动 / 停止（本机未验证）                                                         |
 | `make clean`            | 清理 Python / Node 缓存（`find`、`rm` 命令，建议在 Git Bash 中执行）                                 |
 
-## 测试
+## 测试与评测
 
-回归测试使用内置 Mock LLM，**不需要真实 API Key、不需要向量索引、不需要 Redis**，几秒内可跑完：
+回归测试与离线评测都使用内置 Mock LLM，**不需要真实 API Key、不需要向量索引、不需要 Redis**：
 
-- `backend/tests/test_smoke.py`：8 组用例——SessionStore 消息缓冲语义、Mock LLM 下完整课堂流程（流式帧协议、7 轮 phase、随堂测验、分组研讨、学情档案、重复 start 幂等）、断线续传不丢尾消息、补发只发给当前连接（多连接不串台）、补发与实时推送串行化（不乱序）、发送异常不中止课堂、全部学生超时（告警不吞轮次、老师仍 7 轮）、环节超时告警（overtime）。
-- `backend/tests/test_store.py`：11 项存储层单测——JSON CRUD、会话 meta / profile、消息追加与副本、单会话清理、TTL 过期、追加续期、purge_expired、Redis 未配置降级、Redis 连接失败降级（含 warning）、Redis 成功路径（key / TTL / pipeline）、LayeredMemory 快照序列化。
+- `backend/tests/test_smoke.py`（8 组）：SessionStore 消息缓冲语义、Mock LLM 下完整课堂流程（流式帧协议、7 轮 phase、随堂测验、分组研讨、学情档案、重复 start 幂等）、断线续传不丢尾消息、补发只发给当前连接（多连接不串台）、补发与实时推送串行化、发送异常不中止课堂、全部学生超时（告警不吞轮次、老师仍 7 轮）、环节超时告警（overtime）。
+- `backend/tests/test_store.py`（11 项）：JSON CRUD、会话 meta / profile、消息追加与副本、单会话清理、TTL 过期、追加续期、purge_expired、Redis 未配置降级、Redis 连接失败降级（含 warning）、Redis 成功路径（key / TTL / pipeline）、LayeredMemory 快照序列化。
+- `backend/tests/test_tool_agent.py`（9 项）：ToolAgent ReAct 多步 / 计算 / 知识库 / 步数上限 / 重复动作 / 参数白名单 / 异常降级，MCP stdio roundtrip，以及 SelectorEventLoop 下自动降级。
 
 ```bash
+# 1) 回归测试 + 覆盖率（ai-classroom/ 根目录；预期 28 passed、TOTAL 74%）
+cd ai-classroom
+python -m pytest --cov --cov-report=term
+
+# 2) 静态检查
+python -m ruff check backend
+
+# 3) 离线评测：RAG 检索 + Agent/Tool（Mock；RAG 索引不可用时 RAG 部分 SKIP）
 cd backend
-python tests/test_smoke.py     # 预期最后一行：ALL P0/P1 REGRESSION TESTS PASSED
-python tests/test_store.py     # 预期最后一行：ALL P1 STORE TESTS PASSED
+python eval/run_all.py                        # 报告写入 backend/eval/reports/latest.md
+python eval/rag_eval.py --index "E:\ai_classroom_index" --top-k 4
+python eval/agent_eval.py
 ```
 
-前端构建验证：`cd frontend && npm run build`（本机 Vite 输出约 11.9s、1602 modules；产物 JS 约 1.0MB（gzip 约 344KB）/ CSS 约 368KB（gzip 约 50KB），构建通过）。
+> 兼容旧脚本：`cd backend && python tests/test_smoke.py` / `tests/test_store.py` / `tests/test_tool_agent.py` 仍可单独运行。
+
+**评测口径（⚠️ 不要当线上指标）**：
+
+- **RAG**：60 条评测集（正常 40 / 风险 20）、top-4；HitRate@4=1.0000 (40/40)、MRR@4=0.9563、风险无充分证据率=0.9500 (19/20)。语料仅 1 份教材 / 10 chunks，风险指标是「检索为空或 query 与 top-4 词面重合率 < 0.2」的启发式代理（retriever 无相似度阈值），reranker 默认关闭。
+- **Agent/Tool**：20 个任务（calc 10 / kb 5 / multi_step 3 / risk 2），Mock LLM + FakeRetriever（不联网）；任务成功率 20/20、工具调用成功率 26/26、平均步数 2.25、P95≈0.55ms（本地 Mock 时延）、degraded 1（预期超步数）。只验证 Agent 编排与工具链路，不代表真实 LLM 的 function calling 质量。
+- **覆盖率**：TOTAL 74%（workflow 96% / classroom 89% / store 89% / tool_agent 77%；api/routes 32%、rag/ingest 0% 为已知缺口）。
+- **CI**：`.github/workflows/ci.yml` 已配置（后端 ruff + pytest --cov + 两个评测；前端 `npm ci` + build，不依赖 secrets），本机没有 Actions 运行记录。
+
+前端构建验证：`cd frontend && npm run build`（本机 Vite 输出约 8.2–11.9s、1606 modules；产物 JS 约 1.06MB（gzip 约 346KB）/ CSS 约 371KB（gzip 约 50KB），构建通过）。
 
 性能基线（本机实测；Mock 与真实 API 两种口径，复现命令见项目文档附录 B.9）：
 
@@ -208,6 +256,8 @@ python tests/test_store.py     # 预期最后一行：ALL P1 STORE TESTS PASSED
 | `POST` | `/api/classroom/start`                   | 创建课堂会话；请求体 `{"topic": "授课主题"}`，返回 `{"session_id": "...", "topic": "..."}`                         |
 | `GET`  | `/api/classroom/{session_id}`            | 查询会话状态（`running` / `round` / `phase` / `msg_count` / `message_count` / `profile_ready` 等；本进程无会话时回落到存储层快照） |
 | `GET`  | `/api/classroom/{session_id}/profile`    | 查询学情档案（课堂结束后生成；进程内或持久化存储中查询，未生成 / 会话不存在返回 404）                                                  |
+| `GET`  | `/api/agent/tools`                       | Tool-Use Agent 可用工具列表（本地工具 + MCP 动态注册的 `mcp__*` 工具）与 `mcp_connected` 状态                                     |
+| `POST` | `/api/agent/ask`                         | Tool-Use Agent 执行一次 ReAct 循环；请求 `{question, context}`，返回 `answer / trace / steps / degraded / mcp_connected / tools_used` |
 
 另有 `GET /` 返回服务入口说明，`GET /docs` 为 OpenAPI 文档。
 
@@ -304,8 +354,11 @@ docker compose up -d          # 旧版 Docker：docker-compose up -d
 - 举手 / 发言队列是调度器内部按「性格优先级 + 先来先到」排序学生发言（`SpeakerQueue`），并非真实学生的自主举手请求。
 - 暂无鉴权、多班级、权限体系，定位为 Demo 演示，不建议直接用于真实教学场景；Docker 配置未在本机验证（本机无 Docker）。
 - Mock 模式下学生固定选 B、学情档案数据为模拟值，不代表真实模型表现。
-- 多智能体为**固定工作流编排**（**非自主 Agent**：节点与 `round` 路由由代码固定，LLM 只生成内容、不自主决定拓扑），不等同于 AutoGPT 类系统。
+- 多智能体为**固定工作流编排**（**非自主 Agent**：节点与 `round` 路由由代码固定，LLM 只生成内容、不自主决定拓扑），不等同于 AutoGPT 类系统；另有独立 ToolAgent 模块演示 Function Calling/MCP，不接入课堂自动流程。
+- MCP 在 Windows `uvicorn --reload`（SelectorEventLoop）下不可用，会自动降级为本地工具；需要演示 MCP 时用 `make demo-backend`（无 --reload）。
+- 评测指标口径有限：RAG 为 1 份教材 / 10 chunks 演示语料 + 词面重合启发式代理；Agent 评测为 Mock LLM + FakeRetriever（20 任务）；均不代表真实 LLM 或线上效果。
 
 ## 相关文档
 
-- [项目设计文档（架构、关键技术、踩坑复盘、性能数据）](../AI_Classroom_多智能体互动教学课堂_项目文档.md)
+- [仓库根 README（GitHub 落地页）](../README.md)
+- [项目设计文档（架构、关键技术、踩坑复盘、性能与评测数据）](../AI_Classroom_多智能体互动教学课堂_项目文档.md)
