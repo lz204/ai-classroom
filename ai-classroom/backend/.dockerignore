@@ -1,0 +1,10 @@
+# 排除本地体积较大的模型/索引/依赖缓存，避免打入镜像
+__pycache__/
+*.pyc
+.venv/
+models/
+knowledge_base/faiss_index/
+knowledge_base/*.pdf
+knowledge_base/*.docx
+.env
+*.log

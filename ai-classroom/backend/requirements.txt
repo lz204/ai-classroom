@@ -1,0 +1,35 @@
+# ============ 运行时依赖 ============
+# LangGraph 多智能体编排
+langgraph>=0.2.0
+# LangChain 核心与组件
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.1.0
+langchain-openai>=0.2.0
+# LLM 接入（GLM 走 OpenAI 兼容接口）
+openai>=1.30.0
+# 向量检索
+faiss-cpu>=1.8.0
+rank-bm25>=0.2.2
+# 嵌入与重排模型
+sentence-transformers>=3.0.0
+# 中文分词（BM25 索引与查询）
+jieba>=0.42.1
+# PDF 解析（知识库索引）
+pymupdf>=1.24.0
+# docx 解析（知识库索引）
+python-docx>=1.1.0
+# Web 框架
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+# 数据校验
+pydantic>=2.7.0
+# 配置加载
+python-dotenv>=1.0.1
+# 重试
+tenacity>=8.3.0
+# 断线重传缓冲（未配置 REDIS_URL 时自动使用内存版）
+redis>=5.0.0
+# 内存采样（性能自测）
+psutil>=5.9.0

@@ -1,0 +1,28 @@
+# 环境与密钥
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 模型缓存与向量索引（体积大，不入库）
+models/
+knowledge_base/faiss_index/
+
+# 知识库原始资料：大体积 PDF/DOCX 不入库；
+# 注意不要忽略 txt/md 等文本资料，否则示例教材会被一起排除
+knowledge_base/*.pdf
+knowledge_base/*.docx
+
+# 前端
+node_modules/
+frontend/dist/
+
+# 日志与临时文件
+*.log
+.DS_Store
