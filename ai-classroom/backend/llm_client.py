@@ -1,4 +1,4 @@
-"""LLM 客户端：真实 GLM（OpenAI 兼容接口）与内置 Mock 双模式。
+"""LLM 客户端：真实 LLM（OpenAI 兼容接口，默认阿里百炼 DashScope）与内置 Mock 双模式。
 
 统一对外暴露 `ainvoke(prompt) -> str`，上层 Agent 无需感知底层实现。
 配置了 LLM_API_KEY 时走真实调用；未配置时自动降级为 Mock，保证无 Key 也能跑通课堂全流程。
@@ -32,7 +32,7 @@ class LLMClient:
 
 
 class OpenAIClient(LLMClient):
-    """真实 GLM 客户端（OpenAI 兼容协议）"""
+    """真实 LLM 客户端（OpenAI 兼容协议）"""
 
     def __init__(self, api_key: str, base_url: str, model: str, timeout: float):
         self._model = model
