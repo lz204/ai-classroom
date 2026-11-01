@@ -1,4 +1,4 @@
-# AI Classroom 多智能体互动教学课堂
+# AI Classroom 多智能体互动教学课堂 [![CI](https://github.com/lz204/ai-classroom/actions/workflows/ci.yml/badge.svg)](https://github.com/lz204/ai-classroom/actions/workflows/ci.yml)
 
 > 2026 届计科毕业生 AI 应用 / AI Agent 方向面试项目：LangGraph 多智能体课堂 + RAG + Tool-Use Agent（Function Calling / MCP）工程 Demo。
 
